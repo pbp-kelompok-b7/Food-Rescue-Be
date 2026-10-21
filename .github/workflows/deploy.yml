@@ -1,0 +1,72 @@
+name: Django CI and PWS Deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: food_rescue_ci
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/food_rescue_ci
+      DJANGO_SECRET_KEY: ci-only-not-for-production
+      DJANGO_DEBUG: 'False'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Check Django configuration
+        run: python manage.py check
+      - name: Check migrations
+        run: python manage.py makemigrations --check --dry-run
+      - name: Run tests
+        run: python manage.py test
+
+  deploy:
+    needs: ci
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: pws-deploy
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Push to PWS
+        env:
+          PWS_URL: ${{ secrets.PWS_URL }}
+        run: |
+          if [ -z "$PWS_URL" ]; then
+            echo 'PWS_URL secret is missing.'
+            exit 1
+          fi
+          if ! GIT_TERMINAL_PROMPT=0 git push "$PWS_URL" HEAD:master >/dev/null 2>&1; then
+            echo 'Push to PWS failed. Check credentials and remote branch history.'
+            exit 1
+          fi
+          echo 'Push to PWS succeeded.'

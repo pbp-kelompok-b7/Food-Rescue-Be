@@ -1,6 +1,101 @@
 # Food Rescue
 ## Sustainable Food & Diet / Waste Management
 
+## Setup Backend Lokal
+
+Gunakan Windows PowerShell dengan Python minimal 3.10, Git, serta Docker Desktop yang sudah berjalan.
+
+### 1. Clone repository
+
+```powershell
+git clone https://github.com/pbp-kelompok-b7/Food-Rescue.git be-food-rescue
+cd be-food-rescue
+```
+
+Jika sudah clone, buka terminal di folder backend yang berisi `manage.py` dan `requirements.txt`.
+
+### 2. Install dependency
+
+```powershell
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+Command menggunakan Python dari virtual environment secara langsung, sehingga aktivasi `.venv` tidak diperlukan.
+
+### 3. Konfigurasi environment
+
+Salin template hanya jika `.env` belum ada:
+
+```powershell
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }
+.\.venv\Scripts\python.exe -c "from django.core.management.utils import get_random_secret_key; print(get_random_secret_key())"
+```
+
+Salin secret key yang dihasilkan ke `DJANGO_SECRET_KEY` dalam `.env`. Sesuaikan konfigurasi lokal:
+
+```dotenv
+DJANGO_SECRET_KEY=<secret-key-yang-dihasilkan>
+DJANGO_DEBUG=True
+DJANGO_ALLOWED_HOSTS=127.0.0.1,localhost
+POSTGRES_DB=food_rescue
+POSTGRES_USER=food_rescue
+POSTGRES_PASSWORD=<password-database-lokal>
+POSTGRES_HOST=127.0.0.1
+POSTGRES_PORT=5432
+```
+
+Ganti placeholder sebelum melanjutkan. Docker Compose dan Django membaca konfigurasi dari `.env` yang sama. Jika `DATABASE_URL` diatur, Django memprioritaskannya dibanding `POSTGRES_*`. Jangan commit `.env`.
+
+### 4. Jalankan PostgreSQL
+
+```powershell
+docker compose up -d db
+docker compose exec db sh -c 'pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+```
+
+Lanjutkan setelah muncul `accepting connections`. Pastikan port lokal `5432` tidak digunakan service lain. Kredensial dalam `.env` digunakan saat volume database pertama kali dibuat; perubahan `.env` tidak otomatis mengubah password database yang sudah tersimpan.
+
+### 5. Migration dan server Django
+
+Apps proyek masih kosong. Jalankan `migrate` untuk tabel bawaan Django. Setelah menambahkan model, buat migration dengan `makemigrations` dan commit file yang dihasilkan.
+
+```powershell
+.\.venv\Scripts\python.exe manage.py makemigrations accounts listings requests_app reservations pickups
+.\.venv\Scripts\python.exe manage.py migrate
+.\.venv\Scripts\python.exe manage.py check
+.\.venv\Scripts\python.exe manage.py runserver
+```
+
+Backend menyediakan API JSON di `/api/`. Untuk membuat akun admin, gunakan terminal kedua di folder backend:
+
+```powershell
+.\.venv\Scripts\python.exe manage.py createsuperuser
+```
+
+Halaman admin tersedia di http://127.0.0.1:8000/admin/.
+
+### Pemeriksaan sebelum push
+
+Dengan PostgreSQL berjalan:
+
+```powershell
+.\.venv\Scripts\python.exe manage.py check
+.\.venv\Scripts\python.exe manage.py makemigrations --check --dry-run
+.\.venv\Scripts\python.exe manage.py test
+```
+
+Hentikan server dengan `Ctrl+C`. Untuk menghentikan database tanpa menghapus datanya:
+
+```powershell
+docker compose stop db
+```
+
+Backend menggunakan Django REST Framework. Template halaman pengguna sudah dihapus; konfigurasi Django Templates tetap dipakai Django Admin. Frontend React dikelola terpisah.
+
+Apps masih berupa scaffold kosong. Belum ada model bisnis, endpoint API, atau autentikasi API yang diimplementasikan. Konfigurasi DRF dan CORS tetap tersedia di level project.
+
 ## Kolaborator
 1. 2506534245 - FIQHI DESKI ISMAIL
 2. 2506593613 - NABILA OKTAVIA RAMADHANI
@@ -18,7 +113,7 @@ Problem: _Packaged food surplus_ dan _compostable food waste_ sering tidak tersa
 Solution: _Platform matching_ yang mempertemukan pihak yang memiliki _resource_ dengan pihak yang dapat memanfaatkannya melalui Supply Listing, Request Board, Reservation, dan Pickup. Listing dapat berupa DONATE atau SELL. Untuk SELL, harga ditentukan owner dan pembayaran dilakukan di luar platform.
 
 ## Daftar Modul
-### Module 1 — Supply Listing (ResourceListing)
+### Module 1 â€” Supply Listing (ResourceListing)
 User membuat dan mengelola resource yang dimiliki. Registered User dapat melakukan CRUD, sedangkan public hanya dapat browse/search/filter listing.
 Data utama:
 - resource_type: PACKAGED_FOOD_SURPLUS / COMPOSTABLE_FOOD_WASTE
@@ -33,7 +128,7 @@ Data utama:
 - storage notes, allergen notes, packaging status bila relevan
 - status
 
-### Module 2 — Request Board (ResourceRequest)
+### Module 2 â€” Request Board (ResourceRequest)
 User membuat dan mengelola request resource yang sedang dicari/dibutuhkan. Modul ini memungkinkan user untuk browse active requests, search/filter request, dan provider dapat menawarkan resource terhadap request tertentu.
 Data utama:
 - resource_type/category
@@ -44,7 +139,7 @@ Data utama:
 - valid_until
 - status
 
-### Module 3 — Match/Reservation (Reservation)
+### Module 3 â€” Match/Reservation (Reservation)
 Mengelola kesepakatan antara provider dan receiver. Reservation dapat dibuat ketika receiver claim Supply Listing, atau ketika provider menawarkan supply terhadap Resource Request.
 Fokus modul: siapa mengambil resource apa, berapa quantity, harga yang disepakati, serta approval.
 Data utama:
@@ -56,7 +151,7 @@ Data utama:
 - status: PENDING / ACCEPTED / REJECTED / CANCELLED
 Setelah reservation diterima, stock pada listing dapat diperbarui.
 
-### Module 4 — Pickup & Fulfillment (Pickup)
+### Module 4 â€” Pickup & Fulfillment (Pickup)
 Mengelola pelaksanaan pengambilan setelah reservation diterima.
 Fokus modul: kapan dan di mana handoff dilakukan serta apakah fulfillment berhasil.
 Data utama:
@@ -69,7 +164,7 @@ Data utama:
 
 Fitur: reschedule pickup, update fulfillment status, dan opsi contact redirect ke pihak ke-3. Payment dan negosiasi final dilakukan di luar platform.
 
-### Shared Foundation — Account & Authentication
+### Shared Foundation â€” Account & Authentication
 Modul ini bukan business module utama. Modul ini bertanggung jawab untuk menangani autentikasi dan otorisasi pengguna.
 Mencakup:
 - register, login, logout
@@ -78,7 +173,7 @@ Mencakup:
 - ownership/authorization rules agar user hanya dapat mengelola data miliknya
 
 ### Core flow:
-Supply Listing / Resource Request → Reservation → Pickup → Completed
+Supply Listing / Resource Request â†’ Reservation â†’ Pickup â†’ Completed
 
 ## Pembagian Modul
 [Module 1](#module-1): [Fiqhi](#kolaborator)
