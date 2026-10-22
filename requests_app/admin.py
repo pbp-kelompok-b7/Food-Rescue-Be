@@ -1,3 +1,3 @@
 from django.contrib import admin
 
-# Register your models here.
+# TODO: moderation actions must call domain services and preserve history.

@@ -8,7 +8,7 @@ Gunakan Windows PowerShell dengan Python minimal 3.10, Git, serta Docker Desktop
 ### 1. Clone repository
 
 ```powershell
-git clone https://github.com/pbp-kelompok-b7/Food-Rescue.git be-food-rescue
+git clone https://github.com/pbp-kelompok-b7/Food-Rescue-Be.git be-food-rescue
 cd be-food-rescue
 ```
 
@@ -59,16 +59,15 @@ Lanjutkan setelah muncul `accepting connections`. Pastikan port lokal `5432` tid
 
 ### 5. Migration dan server Django
 
-Apps proyek masih kosong. Jalankan `migrate` untuk tabel bawaan Django. Setelah menambahkan model, buat migration dengan `makemigrations` dan commit file yang dihasilkan.
+Model dasar dan migration awal sudah tersedia. Jalankan `migrate` untuk database pengembangan baru.
 
 ```powershell
-.\.venv\Scripts\python.exe manage.py makemigrations accounts listings requests_app reservations pickups
 .\.venv\Scripts\python.exe manage.py migrate
 .\.venv\Scripts\python.exe manage.py check
 .\.venv\Scripts\python.exe manage.py runserver
 ```
 
-Backend menyediakan API JSON di `/api/`. Untuk membuat akun admin, gunakan terminal kedua di folder backend:
+Backend menyediakan API JSON di `/api/v1/`. Untuk membuat akun admin, gunakan terminal kedua di folder backend:
 
 ```powershell
 .\.venv\Scripts\python.exe manage.py createsuperuser
@@ -94,7 +93,7 @@ docker compose stop db
 
 Backend menggunakan Django REST Framework. Template halaman pengguna sudah dihapus; konfigurasi Django Templates tetap dipakai Django Admin. Frontend React dikelola terpisah.
 
-Apps masih berupa scaffold kosong. Belum ada model bisnis, endpoint API, atau autentikasi API yang diimplementasikan. Konfigurasi DRF dan CORS tetap tersedia di level project.
+Scaffold memuat model dasar, migration, shared API utilities, dan 62 operasi kontrak di `/api/v1/`. Endpoint bisnis masih merespons `501 not_implemented`; login dan transaksi belum berjalan. Lihat [panduan scaffold](docs/scaffolding.md) untuk struktur dan batas implementasi.
 
 ## Kolaborator
 1. 2506534245 - FIQHI DESKI ISMAIL

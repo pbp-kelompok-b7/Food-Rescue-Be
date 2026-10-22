@@ -1,12 +1,6 @@
 from django.contrib import admin
 from django.urls import include, path
 
-urlpatterns = [
-    path("admin/", admin.site.urls),
-    path("api/accounts/", include("accounts.urls")),
-    path("api/listings/", include("listings.urls")),
-    path("api/requests/", include("requests_app.urls")),
-    path("api/reservations/", include("reservations.urls")),
-    path("api/pickups/", include("pickups.urls")),
-]
-
+urlpatterns = [path("admin/", admin.site.urls)]
+for app in ("accounts", "listings", "requests_app", "reservations", "pickups", "shared"):
+    urlpatterns.append(path("api/v1/", include(f"{app}.urls")))
