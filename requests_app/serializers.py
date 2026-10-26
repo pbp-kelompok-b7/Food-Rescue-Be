@@ -5,6 +5,7 @@ from decimal import Decimal
 
 from django.utils import timezone
 from rest_framework import serializers
+from common.exceptions import BusinessConflict
 from shared.enums import ResourceType, Suitability, Unit
 from shared.reference_data import CATEGORY_RESOURCE_TYPES
 from .models import ResourceRequest, RequestStatus
@@ -142,6 +143,14 @@ class RequestWriteSerializer(StrictObjectSerializer):
     def validate(self, attrs):
         if not attrs:
             raise serializers.ValidationError("Supply at least one mutable field.")
+
+        # A valid enum change can also fail cross-field compatibility. Report
+        # the contractual lock conflict first once reservation history exists.
+        locked_fields = ("resource_type", "category", "intended_use", "unit")
+        if self.instance is not None and self.context.get("has_reservations", False):
+            if any(field in attrs and attrs[field] != getattr(self.instance, field) for field in locked_fields):
+                raise BusinessConflict("Resource type, category, intended use and unit are locked after a reservation.",
+                                       code="unit_locked")
 
         def current(field):
             return attrs.get(field, getattr(self.instance, field, None))

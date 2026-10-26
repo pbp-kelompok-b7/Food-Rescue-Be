@@ -179,6 +179,26 @@ class RequestWriteTests(TestCase):
             self.assertEqual(self.edit(source, changes).status_code, 400)
             self.assertEqual(ResourceRequest.objects.values().get(pk=source.pk), before)
 
+    def test_patch_rejects_nonobject_payloads_without_writing(self):
+        source = self.make_request()
+        before = ResourceRequest.objects.values().get(pk=source.pk)
+        for body in ([], [self.body], "hello", 1, None):
+            response = self.client.generic("PATCH", f"{self.url}{source.pk}/", json.dumps(body),
+                                           content_type="application/json")
+            self.assertEqual(response.status_code, 400, response.data)
+            self.assertEqual(ResourceRequest.objects.values().get(pk=source.pk), before)
+
+    def test_locked_fields_return_conflict_before_cross_field_validation(self):
+        source = self.make_request()
+        self.offer(source, "1")
+        before = ResourceRequest.objects.values().get(pk=source.pk)
+        for changes in ({"resource_type": "COMPOSTABLE_FOOD_WASTE"}, {"category": "coffee_grounds"},
+                        {"intended_use": "BSF"}):
+            response = self.edit(source, changes)
+            self.assertEqual(response.status_code, 409, response.data)
+            self.assertEqual(response.data["errors"][0]["code"], "unit_locked")
+            self.assertEqual(ResourceRequest.objects.values().get(pk=source.pk), before)
+
     def test_patch_authorization_public_private_participant_and_admin(self):
         public = self.make_request()
         private = self.make_request(status=RequestStatus.CLOSED)

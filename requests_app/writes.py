@@ -45,14 +45,10 @@ def update_request(request, pk):
                 raise NotFound("Request not found.")
             raise PermissionDenied("Only the owner or admin may edit this request.")
 
-        serializer = RequestWriteSerializer(instance=instance, data=request.data, partial=True)
+        serializer = RequestWriteSerializer(instance=instance, data=request.data, partial=True,
+                                             context={"has_reservations": instance.reservations.exists()})
         serializer.is_valid(raise_exception=True)
         changes = serializer.validated_data
-        locked_fields = ("resource_type", "category", "intended_use", "unit")
-        if any(field in changes and changes[field] != getattr(instance, field) for field in locked_fields):
-            if instance.reservations.exists():
-                raise BusinessConflict("Resource type, category, intended use and unit are locked after a reservation.",
-                                       code="unit_locked")
         quantities = requests_with_quantities().get(pk=pk)
         needed = changes.get("quantity_needed", instance.quantity_needed)
         if needed < quantities.quantity_allocated + quantities.quantity_fulfilled:
