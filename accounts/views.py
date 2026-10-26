@@ -9,13 +9,15 @@ from django.db import IntegrityError, transaction
 from google.auth.exceptions import GoogleAuthError
 from google.auth.transport.requests import Request as GoogleRequest
 from google.oauth2 import id_token
+from rest_framework.response import Response
+from rest_framework import serializers
 from rest_framework.decorators import api_view, permission_classes, throttle_classes
 from rest_framework.permissions import AllowAny, IsAdminUser, IsAuthenticated
 from common.responses import failure, success
 from django.views.decorators.csrf import csrf_protect
 from django.middleware.csrf import get_token
 from .models import User
-from .serializers import GoogleLoginSerializer, UserSelfSerializer, LoginSerializer, LogoutSerializer
+from .serializers import GoogleLoginSerializer, UserSelfSerializer, LoginSerializer, LogoutSerializer, RegisterSerializer
 from .throttles import GoogleLoginThrottle, LoginThrottle
 
 
@@ -49,8 +51,49 @@ def auth_csrf(request):
 @permission_classes([AllowAny])
 @csrf_protect
 def auth_register(request):
-    # TODO: implement this operation.
-    return failure('Endpoint belum diimplementasikan.', [{'field': None, 'code': 'not_implemented', 'message': 'Business logic pending.'}], status=501)
+    serializer = RegisterSerializer(data=request.data)
+
+    if not serializer.is_valid():
+        email_errors = serializer.errors.get("email", [])
+
+        if any(error.code == 'email_exists' for error in email_errors):
+            return failure(
+                message="Email sudah terdaftar",
+                errors=[{
+                    "field": "email",
+                    "code": "email_exists",
+                    "message": "Email sudah terdaftar",
+                }],
+                status=409,
+            )
+
+        raise serializers.ValidationError(serializer.errors)
+
+    try:
+        with transaction.atomic():
+            user = User.objects.create_user(**serializer.validated_data)
+
+    except IntegrityError as exc:
+        constraint = getattr(
+            getattr(exc.__cause__, "diag", None),
+            "constraint_name",
+            None,
+        )
+
+        if constraint == "user_email_case_insensitive":
+            return failure(
+                message="Email sudah terdaftar",
+                errors=[{
+                    "field": "email",
+                    "code": "email_exists",
+                    "message": "Email sudah terdaftar",
+                }],
+                status=409,
+            )
+
+        raise
+
+    return success(UserSelfSerializer(user).data, "Berhasil mendaftar", status=201)
 
 
 # POST /api/v1/auth/login/
@@ -77,7 +120,6 @@ def auth_login(request):
     response['Cache-Control'] = 'no-store'
   
     return response 
-
 
 
 # POST /api/v1/auth/google/
@@ -150,8 +192,10 @@ def auth_google(request):
 def auth_logout(request):
     serializer = LogoutSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
+    
     logout(request)
-    response = success(status=204)
+
+    response = Response(status=204)
     response["Cache-Control"] = "no-store"
     return response
 
@@ -160,7 +204,21 @@ def auth_logout(request):
 @api_view(['GET'])
 @permission_classes([AllowAny])
 def auth_session(request):
-    return session_response(request.user)
+    user = request.user
+
+    if user.is_authenticated and not user.is_active:
+        return failure(
+            message='Akun tidak aktif',
+            errors=[{
+                'field': None,
+                'code': 'authentication_required',
+                'message': 'Akun tidak aktif',
+            }],
+            status=401,
+        )
+    
+    return session_response(user)
+
 
 
 # GET, PATCH /api/v1/users/me/
