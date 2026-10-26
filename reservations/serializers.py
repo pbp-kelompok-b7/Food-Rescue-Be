@@ -6,7 +6,8 @@ from rest_framework import serializers
 
 from common.exceptions import BusinessConflict
 from listings.models import ListingStatus
-from shared.enums import Unit
+from requests_app.models import RequestStatus
+from shared.enums import Mode, ResourceType, Suitability, Unit
 from .models import Reservation, ReservationStatus, SourceType
 
 
@@ -188,5 +189,171 @@ class ListingClaimCreateSerializer(serializers.Serializer):
             mode=listing.mode,
             unit_price=listing.unit_price,
             resource_deadline=listing.available_until,
+            status=ReservationStatus.PENDING,
+        )
+
+
+# Resource-detail keys stored verbatim in Reservation.resource_data for an
+# offer. Quantity/unit/mode/unit_price/resource_deadline live in real columns.
+OFFER_RESOURCE_KEYS = (
+    "resource_type",
+    "title",
+    "category",
+    "description",
+    "condition",
+    "suitability",
+    "location",
+    "storage_notes",
+    "allergen_notes",
+    "packaging_status",
+)
+
+
+class RequestOfferCreateSerializer(serializers.Serializer):
+    """Validate and create a PENDING ``REQUEST_OFFER`` reservation
+    (Technical Design & API Contract Rev 2 section 7.4.2).
+
+    The provider supplies the resource detail, quantity, mode, unit_price, unit,
+    location, and resource_deadline. Provider is the session user; receiver is
+    the request owner. The offer does not require a public listing. A PENDING
+    offer does not reduce the request's remaining quantity, and the price is set
+    at submission time and cannot be revised.
+    """
+
+    resource_type = serializers.ChoiceField(choices=ResourceType.choices)
+    title = serializers.CharField(max_length=200)
+    category = serializers.CharField(max_length=120)
+    description = serializers.CharField(max_length=5000)
+    unit = serializers.ChoiceField(choices=Unit.choices)
+    mode = serializers.ChoiceField(choices=Mode.choices)
+    unit_price = serializers.DecimalField(max_digits=15, decimal_places=2, min_value=Decimal("0"))
+    condition = serializers.CharField(max_length=1000)
+    suitability = serializers.ListField(
+        child=serializers.ChoiceField(choices=Suitability.choices), allow_empty=False
+    )
+    location = serializers.JSONField()
+    storage_notes = serializers.CharField(max_length=2000, required=False, allow_null=True, default=None)
+    allergen_notes = serializers.CharField(max_length=2000, required=False, allow_null=True, default=None)
+    packaging_status = serializers.CharField(max_length=200, required=False, allow_null=True, default=None)
+    quantity = serializers.DecimalField(max_digits=15, decimal_places=3)
+    resource_deadline = serializers.DateTimeField()
+
+    def __init__(self, *args, request_obj=None, user=None, **kwargs):
+        self.request_obj = request_obj
+        self.user = user
+        super().__init__(*args, **kwargs)
+
+    def validate_quantity(self, value):
+        if value <= 0:
+            raise serializers.ValidationError("Quantity must be greater than zero.")
+        unit = self.request_obj.unit
+        if unit in INTEGER_UNITS and value != value.to_integral_value(rounding=ROUND_FLOOR):
+            raise serializers.ValidationError(
+                f"Quantity for unit '{unit}' must be a whole number."
+            )
+        return value
+
+    def validate_resource_deadline(self, value):
+        if value <= timezone.now():
+            raise serializers.ValidationError("Resource deadline must be in the future.")
+        return value
+
+    def validate_suitability(self, value):
+        # De-duplicate while preserving order.
+        seen = list(dict.fromkeys(value))
+        return seen
+
+    def validate(self, attrs):
+        req = self.request_obj
+        user = self.user
+
+        # Self-transaction ban: provider cannot offer to their own request.
+        if req.owner_id == user.id:
+            raise BusinessConflict(
+                "You cannot offer to your own request.", code="self_transaction"
+            )
+
+        # Source must be OPEN and not past its valid_until.
+        if req.status != RequestStatus.OPEN or req.valid_until <= timezone.now():
+            raise BusinessConflict(
+                "This request is not accepting offers.", code="source_not_accepting"
+            )
+
+        # Resource type/category/unit must match the request exactly.
+        mismatches = []
+        if attrs["resource_type"] != req.resource_type:
+            mismatches.append("resource_type")
+        if attrs["category"] != req.category:
+            mismatches.append("category")
+        if attrs["unit"] != req.unit:
+            mismatches.append("unit")
+
+        # Suitability must contain the request's intended_use.
+        if req.intended_use not in attrs["suitability"]:
+            mismatches.append("suitability")
+
+        # Consumption vs waste suitability rule (section 7.2 schema): packaged
+        # food surplus is human-consumption only; compostable waste must not be
+        # human-consumption.
+        suitability = attrs["suitability"]
+        if attrs["resource_type"] == ResourceType.PACKAGED_FOOD_SURPLUS:
+            if suitability != [Suitability.HUMAN_CONSUMPTION]:
+                mismatches.append("suitability")
+        elif attrs["resource_type"] == ResourceType.COMPOSTABLE_FOOD_WASTE:
+            if Suitability.HUMAN_CONSUMPTION in suitability:
+                mismatches.append("suitability")
+
+        # Price/mode rules: DONATE must be zero-priced, SELL must be positive;
+        # donate_only requests forbid SELL; SELL price cannot exceed max_unit_price.
+        if attrs["mode"] == Mode.DONATE and attrs["unit_price"] != 0:
+            mismatches.append("unit_price")
+        if attrs["mode"] == Mode.SELL and attrs["unit_price"] <= 0:
+            mismatches.append("unit_price")
+        if req.donate_only and attrs["mode"] == Mode.SELL:
+            mismatches.append("mode")
+        if (
+            attrs["mode"] == Mode.SELL
+            and req.max_unit_price is not None
+            and attrs["unit_price"] > req.max_unit_price
+        ):
+            mismatches.append("unit_price")
+
+        if mismatches:
+            raise BusinessConflict(
+                f"Offer terms do not match the request: {', '.join(sorted(set(mismatches)))}.",
+                code="terms_mismatch",
+            )
+
+        # Requested quantity must not exceed the remaining need at create time.
+        # PENDING offers do not allocate; only ACCEPTED reservations do.
+        allocated = req.reservations.filter(
+            status__in=ACTIVE_ALLOCATION_STATUSES
+        ).aggregate(total=Sum("quantity"))["total"] or Decimal("0")
+        remaining = req.quantity_needed - allocated
+        if attrs["quantity"] > remaining:
+            raise BusinessConflict(
+                f"Offer quantity exceeds the remaining need ({remaining}).",
+                code="insufficient_quantity",
+            )
+
+        return attrs
+
+    def create(self, validated_data):
+        req = self.request_obj
+        user = self.user
+        resource_data = {key: validated_data[key] for key in OFFER_RESOURCE_KEYS}
+        return Reservation.objects.create(
+            source_type=SourceType.REQUEST_OFFER,
+            listing=None,
+            request=req,
+            provider=user,
+            receiver=req.owner,
+            submitted_by=user,
+            quantity=validated_data["quantity"],
+            unit=validated_data["unit"],
+            mode=validated_data["mode"],
+            unit_price=validated_data["unit_price"],
+            resource_data=resource_data,
+            resource_deadline=validated_data["resource_deadline"],
             status=ReservationStatus.PENDING,
         )
