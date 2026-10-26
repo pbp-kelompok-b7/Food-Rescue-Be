@@ -1,6 +1,7 @@
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAdminUser, IsAuthenticated, IsAuthenticatedOrReadOnly
 from common.responses import failure
+from .queries import browse_requests, request_detail
 
 
 # GET, POST /api/v1/requests/
@@ -8,8 +9,7 @@ from common.responses import failure
 @permission_classes([IsAuthenticatedOrReadOnly])
 def requests(request):
     if request.method == "GET":
-        # TODO: implement this operation.
-        return failure('Endpoint belum diimplementasikan.', [{'field': None, 'code': 'not_implemented', 'message': 'Business logic pending.'}], status=501)
+        return browse_requests(request)
     if request.method == "POST":
         # TODO: implement this operation.
         return failure('Endpoint belum diimplementasikan.', [{'field': None, 'code': 'not_implemented', 'message': 'Business logic pending.'}], status=501)
@@ -20,8 +20,7 @@ def requests(request):
 @permission_classes([IsAuthenticatedOrReadOnly])
 def requests_detail(request, pk):
     if request.method == "GET":
-        # TODO: implement this operation.
-        return failure('Endpoint belum diimplementasikan.', [{'field': None, 'code': 'not_implemented', 'message': 'Business logic pending.'}], status=501)
+        return request_detail(request, pk)
     if request.method == "PATCH":
         # TODO: implement this operation.
         return failure('Endpoint belum diimplementasikan.', [{'field': None, 'code': 'not_implemented', 'message': 'Business logic pending.'}], status=501)
