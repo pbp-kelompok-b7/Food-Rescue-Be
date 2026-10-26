@@ -2,7 +2,7 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAdminUser, IsAuthenticated
 from django.db import IntegrityError, transaction
 from django.utils import timezone
-from rest_framework.exceptions import NotFound, PermissionDenied
+from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
 from common.exceptions import *
 from common.responses import *
 from reservations.models import Reservation, ReservationStatus
@@ -14,6 +14,11 @@ from .serializers import *
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def reservations_detail_pickup(request, pk):
+    if pk <= 0:
+        raise ValidationError(
+            {"id": [ErrorDetail("ID harus bilangan bulat positif.", code="invalid")]}
+        )
+        
     user = request.user
     with transaction.atomic():
         # Lock reservation (schedule ganda / bersaing dengan cancel)
