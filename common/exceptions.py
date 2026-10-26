@@ -1,5 +1,9 @@
 import logging
-from rest_framework.exceptions import APIException
+from rest_framework.exceptions import (
+    APIException,
+    NotAuthenticated,
+    PermissionDenied,
+)
 from rest_framework.views import exception_handler as default_handler
 
 
@@ -20,7 +24,15 @@ def flatten(value, field=None):
 def exception_handler(exc, context):
     response = default_handler(exc, context)
     if response is not None:
-        response.data = {"success": False, "message": "Request failed.", "errors": flatten(response.data)}
+        errors = flatten(response.data)
+        if isinstance(exc, NotAuthenticated):
+            for error in errors:
+                error["code"] = "authentication_required"
+        elif (isinstance(exc, PermissionDenied) and str(exc.detail).startswith("CSRF Failed:")):
+            for error in errors:
+                error["code"] = "csrf_failed"
+        
+        response.data = {"success": False, "message": "Request failed.", "errors": errors} 
     else:
         logging.getLogger(__name__).error("Unhandled API exception", exc_info=(type(exc), exc, exc.__traceback__))
         from .responses import failure
