@@ -28,7 +28,11 @@ def listings_detail_claims(request, pk):
         )
         serializer.is_valid(raise_exception=True)
         reservation = serializer.save()
-    return success(ReservationSerializer(reservation).data, status=201)
+    return success(
+        ReservationSerializer(reservation).data,
+        message="Claim berhasil diajukan",
+        status=201,
+    )
 
 
 # POST /api/v1/requests/<int:pk>/offers/

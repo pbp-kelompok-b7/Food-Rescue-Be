@@ -25,7 +25,7 @@ def make_listing(owner, **overrides):
         created_by=owner,
         resource_type=ResourceType.PACKAGED_FOOD_SURPLUS,
         title="Surplus Ricebox",
-        category="meals",
+        category="prepared_meal",
         description="Fresh ricebox surplus.",
         quantity_total=Decimal("20"),
         unit=Unit.BOX,
@@ -33,12 +33,16 @@ def make_listing(owner, **overrides):
         unit_price=Decimal("0"),
         condition="good",
         suitability=["HUMAN_CONSUMPTION"],
-        location={"address": "Depok"},
+        location={"label": "Kampus UI Depok", "area": "Depok"},
         available_until=timezone.now() + timedelta(days=3),
         status=ListingStatus.AVAILABLE,
     )
     defaults.update(overrides)
     return ResourceListing.objects.create(**defaults)
+
+
+def error_codes(response):
+    return [e["code"] for e in response.data["errors"]]
 
 
 class ListingClaimTests(TestCase):
@@ -59,25 +63,34 @@ class ListingClaimTests(TestCase):
         self.auth(self.receiver)
         res = self.client.post(self.url(self.listing.pk), {"quantity": "5"}, format="json")
         self.assertEqual(res.status_code, 201, res.data)
+        self.assertTrue(res.data["success"])
         data = res.data["data"]
         self.assertEqual(data["status"], ReservationStatus.PENDING)
         self.assertEqual(data["source_type"], SourceType.LISTING_CLAIM)
-        self.assertEqual(data["provider"], self.provider.id)
-        self.assertEqual(data["receiver"], self.receiver.id)
-        self.assertEqual(data["submitted_by"], self.receiver.id)
-        self.assertEqual(data["listing"], self.listing.pk)
-        self.assertIsNone(data["request"])
-        # Unit/mode/price copied from listing.
-        self.assertEqual(data["unit"], self.listing.unit)
-        self.assertEqual(data["mode"], self.listing.mode)
-        self.assertEqual(Decimal(data["unit_price"]), self.listing.unit_price)
-        self.assertEqual(Decimal(data["quantity"]), Decimal("5"))
+        self.assertEqual(data["listing_id"], self.listing.pk)
+        self.assertIsNone(data["request_id"])
+        self.assertEqual(data["provider"]["id"], self.provider.id)
+        self.assertEqual(data["provider"]["display_name"], self.provider.display_name)
+        self.assertEqual(data["receiver"]["id"], self.receiver.id)
+        self.assertEqual(data["submitted_by_id"], self.receiver.id)
+        self.assertIsNone(data["accepted_at"])
+        self.assertIsNone(data["accepted_snapshot"])
+        self.assertIsNone(data["pickup"])
+        self.assertIsNone(data["counterparty_contact"])
+        # terms copied from listing.
+        terms = data["terms"]
+        self.assertEqual(terms["unit"], self.listing.unit)
+        self.assertEqual(terms["mode"], self.listing.mode)
+        self.assertEqual(Decimal(terms["unit_price"]), self.listing.unit_price)
+        self.assertEqual(Decimal(terms["quantity"]), Decimal("5"))
+        self.assertEqual(terms["title"], self.listing.title)
+        self.assertEqual(terms["category"], self.listing.category)
 
     def test_partial_claim_allowed(self):
         self.auth(self.receiver)
         res = self.client.post(self.url(self.listing.pk), {"quantity": "5"}, format="json")
         self.assertEqual(res.status_code, 201)
-        self.assertEqual(Decimal(res.data["data"]["quantity"]), Decimal("5"))
+        self.assertEqual(Decimal(res.data["data"]["terms"]["quantity"]), Decimal("5"))
 
     def test_pending_claim_does_not_allocate_stock(self):
         # Two receivers may both pend the full quantity while PENDING.
@@ -105,10 +118,10 @@ class ListingClaimTests(TestCase):
         )
         self.assertEqual(res.status_code, 201, res.data)
         data = res.data["data"]
-        self.assertEqual(Decimal(data["unit_price"]), self.listing.unit_price)
-        self.assertEqual(data["provider"], self.provider.id)
+        self.assertEqual(Decimal(data["terms"]["unit_price"]), self.listing.unit_price)
+        self.assertEqual(data["provider"]["id"], self.provider.id)
         self.assertEqual(data["status"], ReservationStatus.PENDING)
-        self.assertEqual(data["mode"], self.listing.mode)
+        self.assertEqual(data["terms"]["mode"], self.listing.mode)
 
     # --- Negative: quantity ----------------------------------------------
     def test_quantity_must_be_positive(self):
@@ -120,6 +133,7 @@ class ListingClaimTests(TestCase):
         self.auth(self.receiver)
         res = self.client.post(self.url(self.listing.pk), {"quantity": "21"}, format="json")
         self.assertEqual(res.status_code, 409, res.data)
+        self.assertIn("insufficient_quantity", error_codes(res))
 
     def test_quantity_against_latest_available_after_acceptance(self):
         # An ACCEPTED reservation reduces availability to 15; a claim of 16 fails.
@@ -139,6 +153,7 @@ class ListingClaimTests(TestCase):
         self.auth(self.receiver)
         over = self.client.post(self.url(self.listing.pk), {"quantity": "16"}, format="json")
         self.assertEqual(over.status_code, 409, over.data)
+        self.assertIn("insufficient_quantity", error_codes(over))
         ok = self.client.post(self.url(self.listing.pk), {"quantity": "15"}, format="json")
         self.assertEqual(ok.status_code, 201, ok.data)
 
@@ -152,7 +167,7 @@ class ListingClaimTests(TestCase):
         self.auth(self.receiver)
         res = self.client.post(self.url(kg_listing.pk), {"quantity": "2.5"}, format="json")
         self.assertEqual(res.status_code, 201, res.data)
-        self.assertEqual(Decimal(res.data["data"]["quantity"]), Decimal("2.5"))
+        self.assertEqual(Decimal(res.data["data"]["terms"]["quantity"]), Decimal("2.5"))
 
     def test_precision_beyond_three_decimals_rejected(self):
         kg_listing = make_listing(self.provider, unit=Unit.KG, quantity_total=Decimal("10"))
@@ -165,6 +180,7 @@ class ListingClaimTests(TestCase):
         self.auth(self.provider)
         res = self.client.post(self.url(self.listing.pk), {"quantity": "1"}, format="json")
         self.assertEqual(res.status_code, 409, res.data)
+        self.assertIn("self_transaction", error_codes(res))
         self.assertFalse(Reservation.objects.exists())
 
     # --- Negative: source status / expiry --------------------------------
@@ -174,6 +190,7 @@ class ListingClaimTests(TestCase):
         self.auth(self.receiver)
         res = self.client.post(self.url(self.listing.pk), {"quantity": "1"}, format="json")
         self.assertEqual(res.status_code, 409, res.data)
+        self.assertIn("source_not_accepting", error_codes(res))
 
     def test_claim_past_deadline_rejected(self):
         self.listing.available_until = timezone.now() - timedelta(hours=1)
@@ -181,6 +198,7 @@ class ListingClaimTests(TestCase):
         self.auth(self.receiver)
         res = self.client.post(self.url(self.listing.pk), {"quantity": "1"}, format="json")
         self.assertEqual(res.status_code, 409, res.data)
+        self.assertIn("source_not_accepting", error_codes(res))
 
     def test_claim_missing_listing_returns_404(self):
         self.auth(self.receiver)
@@ -207,14 +225,14 @@ class ListingClaimTests(TestCase):
         self.assertEqual(self.listing.quantity_total, before_qty)
         self.assertEqual(self.listing.status, before_status)
 
-    def test_sell_listing_copies_price(self):
+    def test_sell_listing_copies_price_and_total(self):
         sell_listing = make_listing(
             self.provider, mode=Mode.SELL, unit_price=Decimal("5000.00")
         )
         self.auth(self.receiver)
         res = self.client.post(self.url(sell_listing.pk), {"quantity": "2"}, format="json")
         self.assertEqual(res.status_code, 201, res.data)
-        data = res.data["data"]
-        self.assertEqual(data["mode"], Mode.SELL)
-        self.assertEqual(Decimal(data["unit_price"]), Decimal("5000.00"))
-        self.assertEqual(Decimal(data["total_price"]), Decimal("10000.00"))
+        terms = res.data["data"]["terms"]
+        self.assertEqual(terms["mode"], Mode.SELL)
+        self.assertEqual(Decimal(terms["unit_price"]), Decimal("5000.00"))
+        self.assertEqual(Decimal(terms["total_price"]), Decimal("10000.00"))

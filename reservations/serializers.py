@@ -15,55 +15,107 @@ from .models import Reservation, ReservationStatus, SourceType
 INTEGER_UNITS = {Unit.BOX, Unit.PCS, Unit.PAKET}
 
 # Reservation statuses that hold a claim against listing availability. Per the
-# business rules, PENDING claims do NOT allocate stock, so only ACCEPTED
-# reservations count against the latest available quantity.
+# business rules and Technical Design Rev 2 section 5.1, PENDING claims do NOT
+# allocate stock, so only ACCEPTED reservations count against availability.
 ACTIVE_ALLOCATION_STATUSES = (ReservationStatus.ACCEPTED,)
 
 
-class ReservationSerializer(serializers.ModelSerializer):
-    """Read representation of a reservation.
+def _decimal_str(value, places):
+    quantum = Decimal(1).scaleb(-places)
+    return str(Decimal(value).quantize(quantum))
 
-    NOTE: The exact field contract from "Technical Design & API Contract Food
-    Rescue 2026 - Revisi 2" was not available at implementation time. This shape
-    is intentionally close to the model and should be reconciled with the
-    frozen contract when it becomes available (field names/nesting may change).
+
+class UserRefSerializer(serializers.Serializer):
+    """Minimal user reference used in reservation responses (section 7.4)."""
+
+    id = serializers.IntegerField()
+    display_name = serializers.CharField()
+
+
+class ReservationSerializer(serializers.Serializer):
+    """Read representation of a reservation, matching Technical Design & API
+    Contract Rev 2 section 7.4.
+
+    Fields: {id, created_at, updated_at, version, source_type, listing_id,
+    request_id, provider, receiver, submitted_by_id, status, terms,
+    accepted_snapshot, accepted_at, reason, cancellation_code, pickup,
+    counterparty_contact}.
     """
 
-    total_price = serializers.SerializerMethodField()
+    id = serializers.IntegerField()
+    created_at = serializers.DateTimeField()
+    updated_at = serializers.DateTimeField()
+    version = serializers.IntegerField()
+    source_type = serializers.CharField()
+    listing_id = serializers.IntegerField(allow_null=True)
+    request_id = serializers.IntegerField(allow_null=True)
+    provider = UserRefSerializer()
+    receiver = UserRefSerializer()
+    submitted_by_id = serializers.IntegerField()
+    status = serializers.CharField()
+    terms = serializers.SerializerMethodField()
+    accepted_snapshot = serializers.JSONField()
+    accepted_at = serializers.DateTimeField(allow_null=True)
+    reason = serializers.SerializerMethodField()
+    cancellation_code = serializers.SerializerMethodField()
+    pickup = serializers.SerializerMethodField()
+    counterparty_contact = serializers.SerializerMethodField()
 
-    class Meta:
-        model = Reservation
-        fields = [
-            "id",
-            "source_type",
-            "listing",
-            "request",
-            "provider",
-            "receiver",
-            "submitted_by",
-            "quantity",
-            "unit",
-            "mode",
-            "unit_price",
-            "total_price",
-            "resource_deadline",
-            "status",
-            "reason",
-            "created_at",
-            "updated_at",
-            "version",
-        ]
-        read_only_fields = fields
+    def get_terms(self, obj):
+        # For a listing claim the resource detail is taken from the listing at
+        # claim time; quantity/price come from the reservation. For an offer the
+        # resource detail lives in ``resource_data``.
+        if obj.source_type == SourceType.LISTING_CLAIM and obj.listing_id:
+            listing = obj.listing
+            terms = {
+                "resource_type": listing.resource_type,
+                "title": listing.title,
+                "category": listing.category,
+                "description": listing.description,
+                "condition": listing.condition,
+                "suitability": listing.suitability,
+                "location": listing.location,
+                "storage_notes": listing.storage_notes,
+                "allergen_notes": listing.allergen_notes,
+                "packaging_status": listing.packaging_status,
+            }
+        else:
+            terms = dict(obj.resource_data or {})
+        terms.update(
+            {
+                "quantity": _decimal_str(obj.quantity, 3),
+                "unit": obj.unit,
+                "mode": obj.mode,
+                "unit_price": _decimal_str(obj.unit_price, 2),
+                "total_price": _decimal_str(obj.quantity * obj.unit_price, 2),
+                "resource_deadline": obj.resource_deadline,
+            }
+        )
+        return terms
 
-    def get_total_price(self, obj):
-        return str((obj.quantity * obj.unit_price).quantize(Decimal("0.01")))
+    def get_reason(self, obj):
+        return obj.reason or None
+
+    def get_cancellation_code(self, obj):
+        return obj.cancellation_code or None
+
+    def get_pickup(self, obj):
+        # Pickup scheduling (section 7.5) is out of scope for this endpoint; a
+        # freshly created PENDING claim never has a pickup.
+        return None
+
+    def get_counterparty_contact(self, obj):
+        # Contact is only exposed to the transaction partner once ACCEPTED
+        # (section 7.4.4). A PENDING claim exposes no contact.
+        return None
 
 
 class ListingClaimCreateSerializer(serializers.Serializer):
-    """Validate and create a PENDING ``LISTING_CLAIM`` reservation.
+    """Validate and create a PENDING ``LISTING_CLAIM`` reservation
+    (Technical Design & API Contract Rev 2 section 7.4.1).
 
     The client may only supply ``quantity``. All transaction-defining fields
-    (owner/provider, receiver, price, unit, mode, status, source) are derived
+    (provider, receiver, price, unit, mode, status, source) are derived
     server-side from the listing and the authenticated session user so a client
     cannot forge price/owner/status.
     """
@@ -91,23 +143,30 @@ class ListingClaimCreateSerializer(serializers.Serializer):
 
         # Self-transaction ban: the claimant cannot be the listing owner.
         if listing.owner_id == user.id:
-            raise BusinessConflict("You cannot claim your own listing.")
+            raise BusinessConflict(
+                "You cannot claim your own listing.", code="self_transaction"
+            )
 
-        # Source must be AVAILABLE and not past its deadline.
-        if listing.status != ListingStatus.AVAILABLE:
-            raise BusinessConflict("This listing is not available for claims.")
-        if listing.available_until <= timezone.now():
-            raise BusinessConflict("This listing has passed its deadline.")
+        # Source must be AVAILABLE and not past its deadline. The contract uses
+        # a single ``source_not_accepting`` code for both conditions.
+        if (
+            listing.status != ListingStatus.AVAILABLE
+            or listing.available_until <= timezone.now()
+        ):
+            raise BusinessConflict(
+                "This listing is not accepting claims.", code="source_not_accepting"
+            )
 
-        # Requested quantity must not exceed the latest available quantity.
-        # PENDING claims do not allocate stock; only ACCEPTED reservations do.
+        # Requested quantity must not exceed the available quantity at create
+        # time. PENDING claims do not allocate stock; only ACCEPTED do.
         allocated = listing.reservations.filter(
             status__in=ACTIVE_ALLOCATION_STATUSES
         ).aggregate(total=Sum("quantity"))["total"] or Decimal("0")
         available = listing.quantity_total - allocated
         if attrs["quantity"] > available:
             raise BusinessConflict(
-                f"Requested quantity exceeds the available quantity ({available})."
+                f"Requested quantity exceeds the available quantity ({available}).",
+                code="insufficient_quantity",
             )
 
         return attrs
