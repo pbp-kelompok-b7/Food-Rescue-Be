@@ -4,7 +4,12 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAdminUser, IsAuthenticated
 from common.responses import failure, success
 from listings.models import ResourceListing
-from .serializers import ListingClaimCreateSerializer, ReservationSerializer
+from requests_app.models import ResourceRequest
+from .serializers import (
+    ListingClaimCreateSerializer,
+    RequestOfferCreateSerializer,
+    ReservationSerializer,
+)
 
 
 # POST /api/v1/listings/<int:pk>/claims/
@@ -28,19 +33,36 @@ def listings_detail_claims(request, pk):
         )
         serializer.is_valid(raise_exception=True)
         reservation = serializer.save()
-    return success(
-        ReservationSerializer(reservation).data,
-        message="Claim berhasil diajukan",
-        status=201,
-    )
+    return success(ReservationSerializer(reservation).data, status=201)
 
 
 # POST /api/v1/requests/<int:pk>/offers/
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def requests_detail_offers(request, pk):
-    # TODO: implement this operation.
-    return failure('Endpoint belum diimplementasikan.', [{'field': None, 'code': 'not_implemented', 'message': 'Business logic pending.'}], status=501)
+    """Create a PENDING REQUEST_OFFER reservation for the given request.
+
+    The provider (offering user) is the authenticated session user; the receiver
+    is the request owner. The provider supplies the resource detail, quantity,
+    mode, unit_price, and resource_deadline; no public listing is required. A
+    PENDING offer does not reduce the request's remaining need.
+    """
+    with transaction.atomic():
+        # Lock the request row so the remaining-need check and creation are
+        # consistent under concurrent offers (effective on PostgreSQL).
+        resource_request = get_object_or_404(
+            ResourceRequest.objects.select_for_update(), pk=pk
+        )
+        serializer = RequestOfferCreateSerializer(
+            data=request.data, request_obj=resource_request, user=request.user
+        )
+        serializer.is_valid(raise_exception=True)
+        reservation = serializer.save()
+    return success(
+        ReservationSerializer(reservation).data,
+        message="Offer berhasil diajukan",
+        status=201,
+    )
 
 
 # GET /api/v1/reservations/
