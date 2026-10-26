@@ -56,7 +56,7 @@ class RegisterSerializer(StrictSerializer):
 class LogoutSerializer(StrictSerializer):
     pass
 
-class ProfileSerializer(serializers.Serializer):
+class ProfileSerializer(StrictSerializer):
     display_name=serializers.CharField(min_length=1, max_length=100, required=False)
     whatsapp_number = serializers.RegexField(
         regex=r"^\+[1-9]\d{7,14}$",
@@ -66,9 +66,9 @@ class ProfileSerializer(serializers.Serializer):
 
     def validate(self, attrs):
         if not attrs:
-            return serializers.ValidationError(
+            raise serializers.ValidationError(
                 'Minimal mengisi satu field',
-                code='empty update',
+                code='empty_update',
             )
 
         return attrs

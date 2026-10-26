@@ -483,3 +483,329 @@ class GoogleSignInTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data["data"], {"authenticated": False, "user": None})
         self.assertEqual(self.client.post("/api/v1/auth/logout/").status_code, 401)
+
+
+class UserProfileContractTests(TestCase):
+    """Tests for GET and PATCH /api/v1/users/me/."""
+
+    url = "/api/v1/users/me/"
+    password = "SecurePassword!234"
+
+    user_fields = {
+        "id", "email", "display_name", "whatsapp_number",
+        "is_active", "is_admin", "created_at",
+        "updated_at", "version",
+    }
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = User.objects.create_user(
+            email="rina@example.com",
+            password=cls.password,
+            display_name="Rina",
+            whatsapp_number="+628123456789",
+        )
+        cls.other_user = User.objects.create_user(
+            email="budi@example.com",
+            password=cls.password,
+            display_name="Budi",
+        )
+
+    def setUp(self):
+        cache.clear()
+        self.client = APIClient(enforce_csrf_checks=True)
+
+    def csrf(self):
+        response = self.client.get("/api/v1/auth/csrf/")
+        self.assertEqual(response.status_code, 200)
+        return response.json()["data"]["csrf_token"]
+
+    def login(self):
+        response = self.client.post(
+            "/api/v1/auth/login/",
+            {
+                "email": self.user.email,
+                "password": self.password,
+            },
+            format="json",
+            HTTP_X_CSRFTOKEN=self.csrf(),
+        )
+        self.assertEqual(response.status_code, 200)
+
+    def patch_profile(self, data, with_csrf=True):
+        headers = (
+            {"HTTP_X_CSRFTOKEN": self.csrf()}
+            if with_csrf else {}
+        )
+        return self.client.patch(
+            self.url, data, format="json", **headers
+        )
+
+    def assert_error(self, response, status, code=None):
+        self.assertEqual(response.status_code, status)
+        payload = response.json()
+        self.assertFalse(payload["success"])
+        self.assertIsInstance(payload["message"], str)
+        self.assertTrue(payload["errors"])
+
+        for error in payload["errors"]:
+            self.assertEqual(
+                set(error), {"field", "code", "message"}
+            )
+
+        if code is not None:
+            self.assertIn(
+                code,
+                [error["code"] for error in payload["errors"]],
+            )
+
+    # GET /users/me/
+
+    def test_get_profile_authenticated(self):
+        self.login()
+
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["success"])
+
+        data = payload["data"]
+        self.assertEqual(set(data), self.user_fields)
+        self.assertEqual(data["id"], self.user.pk)
+        self.assertEqual(data["email"], self.user.email)
+        self.assertEqual(data["display_name"], "Rina")
+        self.assertEqual(
+            data["whatsapp_number"], "+628123456789"
+        )
+
+    def test_get_profile_does_not_expose_sensitive_data(self):
+        self.login()
+
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()["data"]
+
+        self.assertNotIn("password", data)
+        self.assertNotIn("google_sub", data)
+        self.assertNotIn("sessionid", data)
+        self.assertNotIn(self.user.password, str(data))
+        self.assertNotEqual(data["id"], self.other_user.pk)
+
+    def test_get_profile_anonymous_rejected(self):
+        response = self.client.get(self.url)
+        self.assert_error(
+            response, 401, "authentication_required"
+        )
+
+    def test_get_profile_inactive_rejected(self):
+        self.login()
+        User.objects.filter(pk=self.user.pk).update(
+            is_active=False
+        )
+
+        response = self.client.get(self.url)
+        self.assert_error(
+            response, 401, "authentication_required"
+        )
+
+    # PATCH /users/me/
+
+    def test_patch_display_name_only(self):
+        self.login()
+
+        response = self.patch_profile({
+            "display_name": "Rina Putri"
+        })
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["success"])
+
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.display_name, "Rina Putri")
+        self.assertEqual(
+            self.user.whatsapp_number, "+628123456789"
+        )
+
+        self.assertEqual(
+            response.json()["data"]["display_name"],
+            "Rina Putri",
+        )
+
+    def test_patch_whatsapp_only(self):
+        self.login()
+
+        response = self.patch_profile({
+            "whatsapp_number": "+628987654321"
+        })
+
+        self.assertEqual(response.status_code, 200)
+
+        self.user.refresh_from_db()
+        self.assertEqual(
+            self.user.whatsapp_number, "+628987654321"
+        )
+        self.assertEqual(self.user.display_name, "Rina")
+
+    def test_patch_both_fields(self):
+        self.login()
+
+        response = self.patch_profile({
+            "display_name": "Rina Updated",
+            "whatsapp_number": "+628111222333",
+        })
+
+        self.assertEqual(response.status_code, 200)
+
+        self.user.refresh_from_db()
+        self.assertEqual(
+            self.user.display_name, "Rina Updated"
+        )
+        self.assertEqual(
+            self.user.whatsapp_number, "+628111222333"
+        )
+
+    def test_patch_whatsapp_null(self):
+        self.login()
+
+        response = self.patch_profile({
+            "whatsapp_number": None
+        })
+
+        self.assertEqual(response.status_code, 200)
+
+        self.user.refresh_from_db()
+        self.assertIsNone(self.user.whatsapp_number)
+
+    def test_patch_empty_body_rejected(self):
+        self.login()
+
+        response = self.patch_profile({})
+        self.assert_error(response, 400, "empty_update")
+
+    def test_patch_invalid_display_name(self):
+        self.login()
+
+        for value in ("", "x" * 101):
+            with self.subTest(value=value):
+                response = self.patch_profile({
+                    "display_name": value
+                })
+                self.assert_error(response, 400)
+
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.display_name, "Rina")
+
+    def test_patch_invalid_whatsapp(self):
+        self.login()
+
+        invalid_numbers = [
+            "08123456789",
+            "+0123456789",
+            "+628abc123",
+            "+62812 3456789",
+            "",
+        ]
+
+        for number in invalid_numbers:
+            with self.subTest(number=number):
+                response = self.patch_profile({
+                    "whatsapp_number": number
+                })
+                self.assert_error(response, 400)
+
+        self.user.refresh_from_db()
+        self.assertEqual(
+            self.user.whatsapp_number, "+628123456789"
+        )
+
+    def test_patch_readonly_fields_rejected(self):
+        self.login()
+
+        cases = [
+            {"email": "changed@example.com"},
+            {"password": "NewPassword!123"},
+            {"is_admin": True},
+            {"is_active": False},
+        ]
+
+        for body in cases:
+            with self.subTest(body=body):
+                response = self.patch_profile(body)
+                self.assert_error(response, 400, "unknown_field")
+
+        self.user.refresh_from_db()
+        self.assertEqual(
+            self.user.email, "rina@example.com"
+        )
+        self.assertFalse(self.user.is_admin)
+        self.assertTrue(self.user.is_active)
+        self.assertTrue(
+            self.user.check_password(self.password)
+        )
+
+    def test_patch_invalid_input_is_atomic(self):
+        self.login()
+
+        response = self.patch_profile({
+            "display_name": "Changed Name",
+            "whatsapp_number": "invalid-number",
+        })
+
+        self.assert_error(response, 400)
+
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.display_name, "Rina")
+        self.assertEqual(
+            self.user.whatsapp_number, "+628123456789"
+        )
+
+    def test_patch_anonymous_rejected(self):
+        response = self.patch_profile({
+            "display_name": "Unauthorized"
+        })
+        self.assert_error(
+            response, 401, "authentication_required"
+        )
+
+    def test_patch_missing_csrf_rejected(self):
+        self.login()
+
+        response = self.patch_profile(
+            {"display_name": "Changed"},
+            with_csrf=False,
+        )
+        self.assert_error(response, 403, "csrf_failed")
+
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.display_name, "Rina")
+
+    def test_patch_invalid_csrf_rejected(self):
+        self.login()
+
+        response = self.client.patch(
+            self.url,
+            {"display_name": "Changed"},
+            format="json",
+            HTTP_X_CSRFTOKEN="invalid-token",
+        )
+
+        self.assert_error(response, 403, "csrf_failed")
+
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.display_name, "Rina")
+
+    def test_patch_does_not_modify_other_users(self):
+        self.login()
+
+        response = self.patch_profile({
+            "display_name": "Rina Updated"
+        })
+
+        self.assertEqual(response.status_code, 200)
+
+        self.other_user.refresh_from_db()
+        self.assertEqual(
+            self.other_user.display_name, "Budi"
+        )
