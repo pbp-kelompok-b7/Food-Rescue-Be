@@ -1,4 +1,5 @@
 import logging
+from django.http import JsonResponse
 from rest_framework.exceptions import (
     APIException,
     NotAuthenticated,
@@ -11,6 +12,17 @@ class BusinessConflict(APIException):
     status_code = 409
     default_detail = "State conflicts with this operation."
     default_code = "invalid_transition"
+
+
+def csrf_failure(request, reason=""):
+    message = "Token CSRF tidak valid."
+    response = JsonResponse({
+        "success": False,
+        "message": message,
+        "errors": [{"field": None, "code": "csrf_failed", "message": message}],
+    }, status=403)
+    response["Cache-Control"] = "no-store"
+    return response
 
 
 def flatten(value, field=None):
