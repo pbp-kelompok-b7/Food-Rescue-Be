@@ -17,7 +17,7 @@ from common.responses import failure, success
 from django.views.decorators.csrf import csrf_protect
 from django.middleware.csrf import get_token
 from .models import User
-from .serializers import GoogleLoginSerializer, UserSelfSerializer, LoginSerializer, LogoutSerializer, RegisterSerializer
+from .serializers import GoogleLoginSerializer, UserSelfSerializer, LoginSerializer, LogoutSerializer, RegisterSerializer, ProfileSerializer
 from .throttles import GoogleLoginThrottle, LoginThrottle
 
 
@@ -54,7 +54,7 @@ def auth_register(request):
     serializer = RegisterSerializer(data=request.data)
 
     if not serializer.is_valid():
-        email_errors = serializer.errors.get("email", [])
+        email_errors= serializer.errors.get("email", [])
 
         if any(error.code == 'email_exists' for error in email_errors):
             return failure(
@@ -204,34 +204,30 @@ def auth_logout(request):
 @api_view(['GET'])
 @permission_classes([AllowAny])
 def auth_session(request):
-    user = request.user
-
-    if user.is_authenticated and not user.is_active:
-        return failure(
-            message='Akun tidak aktif',
-            errors=[{
-                'field': None,
-                'code': 'authentication_required',
-                'message': 'Akun tidak aktif',
-            }],
-            status=401,
-        )
-    
-    return session_response(user)
+    return session_response(request.user)
 
 
 
 # GET, PATCH /api/v1/users/me/
 @api_view(['GET', 'PATCH'])
 @permission_classes([IsAuthenticated])
+@csrf_protect
 def users_me(request):
     if request.method == "GET":
-        # TODO: implement this operation.
-        return failure('Endpoint belum diimplementasikan.', [{'field': None, 'code': 'not_implemented', 'message': 'Business logic pending.'}], status=501)
-    if request.method == "PATCH":
-        # TODO: implement this operation.
-        return failure('Endpoint belum diimplementasikan.', [{'field': None, 'code': 'not_implemented', 'message': 'Business logic pending.'}], status=501)
+        return success(UserSelfSerializer(request.user).data, 'Data berhasil diambil')
 
+    if request.method == "PATCH":
+        serializer = ProfileSerializer(data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        
+        user = request.user
+
+        for field, value in serializer.validated_data.items():
+            setattr(user, field, value) 
+
+        user.save()
+
+        return success(UserSelfSerializer(user).data, 'Profile berhasil diperbarui')
 
 # GET /api/v1/admin/users/
 @api_view(['GET'])
