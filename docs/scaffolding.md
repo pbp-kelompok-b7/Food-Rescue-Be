@@ -13,23 +13,7 @@ Tidak ada generator class/route, manifest runtime, service factory backend, atau
 
 ## Status implementasi
 
-GET `/api/v1/requests/` dan GET `/api/v1/requests/{id}/` sudah diimplementasikan untuk issue #13 (RB-BE-01). Endpoint lain masih mengembalikan 501. Login/register dilindungi CSRF. Operasi tulis bisnis, audit writes, Nominatim, dan expiry belum diimplementasikan.
-
-### Request Board: browse, detail, dan histori
-
-- Publik hanya melihat request OPEN, belum melewati `valid_until`, tidak diarsipkan, dan memiliki sisa kebutuhan positif. Kondisi ini juga berlaku pada akses detail publik.
-- `scope=mine` memerlukan akun aktif dan hanya menampilkan request milik sendiri, termasuk semua status dan arsip. `status` hanya boleh dipakai pada scope ini.
-- Detail nonpublik tersedia bagi pemilik, peserta reservation terkait (termasuk histori rejected/cancelled), dan admin aktif. Akun lain mendapat 404. Owner pada response hanya berisi id dan display_name; kontak tidak disertakan.
-- Filter: `q` (2–100 karakter; judul, deskripsi, kategori, label lokasi, atau area), `resource_type`, `category`, `area` (exact, case-insensitive), `intended_use`, dan `donate_only=true|false`.
-- Ordering: `created_at`, `-created_at`, `valid_until`, `-valid_until`. Default `-created_at`, dengan `-id` untuk urutan stabil pada nilai waktu yang sama.
-- Pagination: `page` default 1, `page_size` default 20 (1–100). Halaman di luar rentang mendapat 404 `page_not_found`; tipe/parameter invalid mendapat 400. Parameter kosong, berulang, dan tidak dikenal ditolak.
-- Quantity dihitung dari reservation ACCEPTED: pickup selesai menjadi fulfilled, pickup yang belum selesai menjadi allocated; cancelled/no-show tidak dialokasikan. Remaining = needed − allocated − fulfilled. Pending/rejected/cancelled tidak mengurangi remaining.
-- GET tidak menulis status, membatalkan pengajuan, atau mengubah version. Request kedaluwarsa disembunyikan dari publik meskipun proses expiry belum memperbarui status tersimpan; accepted tetap dihitung dan histori dapat dibaca.
-- Vocabulary kategori sementara memakai enam kode seed usulan Technical Design §7.6.1 di `shared/reference_data.py`. Implementasi reference-data (dependensi SF) perlu memakai vocabulary yang sama.
-
-Contoh: `/api/v1/requests/?area=Depok&donate_only=true&page_size=20` dan `/api/v1/requests/?scope=mine&status=CLOSED`.
-
-Tes terfokus: `.\.venv\Scripts\python.exe manage.py test requests_app --settings=config.test_settings`. Untuk PostgreSQL, hilangkan `--settings=config.test_settings`; kredensial lokal harus benar dan user database harus dapat membuat database test.
+Endpoint masih mengembalikan 501. Akses menggunakan permission DRF standar; login/register dilindungi CSRF. Serializer, filter, per-object authorization, operasi quantity/state, audit writes, Nominatim, dan expiry belum diimplementasikan. Tidak ada expiry command atau rate limit custom yang berpura-pura siap.
 
 Model dan migration tersedia sebagai dasar. Beberapa detail schema masih perlu ditinjau saat implementasi. Database lokal belum dimigrasi dalam pekerjaan ini. Bila database pernah memakai User bawaan Django, jangan menganggap migrate otomatis mengonversinya ke custom User.
 

@@ -55,7 +55,7 @@ docker compose up -d db
 docker compose exec db sh -c 'pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
 ```
 
-Lanjutkan setelah muncul `accepting connections`. Port lokal mengikuti `POSTGRES_PORT` dalam `.env` (default `5432`); port PostgreSQL di dalam container tetap `5432`. Jika PostgreSQL Windows sudah memakai port `5432`, gunakan `POSTGRES_PORT=5433` dan jalankan ulang `docker compose up -d db`. Kredensial dalam `.env` digunakan saat volume database pertama kali dibuat; perubahan `.env` tidak otomatis mengubah password database yang sudah tersimpan.
+Lanjutkan setelah muncul `accepting connections`. Pastikan port lokal `5432` tidak digunakan service lain. Kredensial dalam `.env` digunakan saat volume database pertama kali dibuat; perubahan `.env` tidak otomatis mengubah password database yang sudah tersimpan.
 
 ### 5. Migration dan server Django
 
@@ -93,7 +93,7 @@ docker compose stop db
 
 Backend menggunakan Django REST Framework. Template halaman pengguna sudah dihapus; konfigurasi Django Templates tetap dipakai Django Admin. Frontend React dikelola terpisah.
 
-Scaffold memuat model dasar, migration, shared API utilities, dan 62 operasi kontrak di `/api/v1/`. Browse/filter, detail, dan histori Request Board (GET `/requests/` dan `/requests/{id}/`) sudah tersedia. Endpoint bisnis lainnya masih merespons `501 not_implemented`; login dan transaksi belum berjalan. Lihat [panduan scaffold](docs/scaffolding.md) untuk struktur dan batas implementasi.
+Scaffold memuat model dasar, migration, shared API utilities, dan 62 operasi kontrak di `/api/v1/`. Endpoint bisnis masih merespons `501 not_implemented`; login dan transaksi belum berjalan. Lihat [panduan scaffold](docs/scaffolding.md) untuk struktur dan batas implementasi.
 
 ## Kolaborator
 1. 2506534245 - FIQHI DESKI ISMAIL
