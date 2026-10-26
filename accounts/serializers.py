@@ -1,8 +1,9 @@
 from rest_framework import serializers
+from common.serializers import StrictSerializer
 from .models import User
 
 
-class GoogleLoginSerializer(serializers.Serializer):
+class GoogleLoginSerializer(StrictSerializer):
     credential = serializers.CharField(max_length=8192, trim_whitespace=False)
 
 
@@ -15,7 +16,7 @@ class UserSelfSerializer(serializers.ModelSerializer):
         )
         read_only_fields = fields
 
-class LoginSerializer(serializers.Serializer):
+class LoginSerializer(StrictSerializer):
     email = serializers.EmailField(max_length=254)
     password = serializers.CharField(
         write_only=True,
@@ -25,3 +26,7 @@ class LoginSerializer(serializers.Serializer):
 
     def validate_email(self, value):
         return value.lower()
+
+
+class LogoutSerializer(StrictSerializer):
+    pass

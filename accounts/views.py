@@ -15,8 +15,8 @@ from common.responses import failure, success
 from django.views.decorators.csrf import csrf_protect
 from django.middleware.csrf import get_token
 from .models import User
-from .serializers import GoogleLoginSerializer, UserSelfSerializer, LoginSerializer
-from .throttles import GoogleLoginThrottle
+from .serializers import GoogleLoginSerializer, UserSelfSerializer, LoginSerializer, LogoutSerializer
+from .throttles import GoogleLoginThrottle, LoginThrottle
 
 
 def session_response(user):
@@ -56,6 +56,7 @@ def auth_register(request):
 # POST /api/v1/auth/login/
 @api_view(['POST'])
 @permission_classes([AllowAny])
+@throttle_classes([LoginThrottle])
 @csrf_protect
 def auth_login(request):
     serializer = LoginSerializer(data=request.data)
@@ -147,6 +148,8 @@ def auth_google(request):
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def auth_logout(request):
+    serializer = LogoutSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
     logout(request)
     response = success(status=204)
     response["Cache-Control"] = "no-store"
