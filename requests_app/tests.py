@@ -167,7 +167,7 @@ class RequestReadTests(TestCase):
 
     def test_valid_until_equal_to_now_is_already_hidden(self):
         source = self.make_request(valid_until=self.now)
-        with patch("requests_app.queries.timezone.now", return_value=self.now):
+        with patch("requests_app.views.timezone.now", return_value=self.now):
             self.assertEqual(self.ids(self.client.get(self.url)), [])
             self.assertEqual(self.detail(source).status_code, 404)
             self.client.force_authenticate(self.owner)
