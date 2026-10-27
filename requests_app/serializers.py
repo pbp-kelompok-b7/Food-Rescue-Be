@@ -107,6 +107,14 @@ class LocationTextField(serializers.CharField):
         return super().to_internal_value(data)
 
 
+class RequestCloseSerializer(StrictObjectSerializer):
+    reason = LocationTextField(min_length=1, max_length=1000)
+
+
+class RequestDeleteSerializer(StrictObjectSerializer):
+    pass
+
+
 class RequestLocationSerializer(StrictObjectSerializer):
     label = LocationTextField(min_length=1, max_length=300)
     area = LocationTextField(min_length=1, max_length=100)

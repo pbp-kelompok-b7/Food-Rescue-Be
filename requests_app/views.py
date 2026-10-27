@@ -4,6 +4,7 @@ from rest_framework.permissions import IsAdminUser, IsAuthenticated, IsAuthentic
 from common.responses import failure
 from .queries import browse_requests, request_detail
 from .writes import create_request, update_request
+from .lifecycle import close_request, delete_request
 
 
 # GET, POST /api/v1/requests/
@@ -27,16 +28,15 @@ def requests_detail(request, pk):
     if request.method == "PATCH":
         return update_request(request, pk)
     if request.method == "DELETE":
-        # TODO: implement this operation.
-        return failure('Endpoint belum diimplementasikan.', [{'field': None, 'code': 'not_implemented', 'message': 'Business logic pending.'}], status=501)
+        return delete_request(request, pk)
 
 
 # POST /api/v1/requests/<int:pk>/close/
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
+@parser_classes([JSONParser])
 def requests_detail_close(request, pk):
-    # TODO: implement this operation.
-    return failure('Endpoint belum diimplementasikan.', [{'field': None, 'code': 'not_implemented', 'message': 'Business logic pending.'}], status=501)
+    return close_request(request, pk)
 
 
 # GET, POST /api/v1/admin/requests/
