@@ -1036,3 +1036,237 @@ class ReservationAcceptTests(TestCase):
         res = self.accept(offer.pk, 1)
         self.assertEqual(res.status_code, 409, res.data)
         self.assertIn("terms_mismatch", error_codes(res))
+
+
+from pickups.models import Pickup, PickupStatus
+
+
+def make_pickup(reservation, status=PickupStatus.SCHEDULED, **overrides):
+    defaults = dict(
+        reservation=reservation,
+        scheduled_at=timezone.now() + timedelta(hours=5),
+        location={"label": "Kampus UI Depok", "area": "Depok", "latitude": -6.36, "longitude": 106.82},
+        instructions=None,
+        status=status,
+    )
+    defaults.update(overrides)
+    return Pickup.objects.create(**defaults)
+
+
+class ReservationRejectTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.provider = make_user("rej_provider@example.com")
+        self.receiver = make_user("rej_receiver@example.com")
+        self.outsider = make_user("rej_outsider@example.com")
+        self.listing = make_listing(self.provider, quantity_total=Decimal("20"))
+        self.res = make_claim_reservation(self.listing, self.receiver, quantity=Decimal("5"))
+
+    def auth(self, user):
+        self.client.force_authenticate(user)
+
+    def url(self, pk):
+        return f"/api/v1/reservations/{pk}/reject/"
+
+    def reject(self, pk, version=1, reason="No longer available."):
+        return self.client.post(
+            self.url(pk), {"reason": reason, "expected_version": version}, format="json"
+        )
+
+    def test_provider_rejects_claim(self):
+        self.auth(self.provider)
+        res = self.reject(self.res.pk, 1)
+        self.assertEqual(res.status_code, 200, res.data)
+        self.assertEqual(res.data["data"]["status"], ReservationStatus.REJECTED)
+        self.assertEqual(res.data["data"]["reason"], "No longer available.")
+        self.res.refresh_from_db()
+        self.assertEqual(self.res.status, ReservationStatus.REJECTED)
+        # Quantity unchanged.
+        self.assertEqual(self.res.quantity, Decimal("5"))
+
+    def test_reject_keeps_listing_available(self):
+        self.auth(self.provider)
+        self.reject(self.res.pk, 1)
+        self.listing.refresh_from_db()
+        self.assertEqual(self.listing.status, ListingStatus.AVAILABLE)
+
+    def test_submitter_cannot_reject(self):
+        # Receiver submitted the claim; only the provider (approver) may reject.
+        self.auth(self.receiver)
+        res = self.reject(self.res.pk, 1)
+        self.assertEqual(res.status_code, 409, res.data)
+        self.assertIn("invalid_transition", error_codes(res))
+
+    def test_outsider_gets_404(self):
+        self.auth(self.outsider)
+        self.assertEqual(self.reject(self.res.pk, 1).status_code, 404)
+
+    def test_reject_requires_auth(self):
+        self.assertEqual(self.reject(self.res.pk, 1).status_code, 401)
+
+    def test_reason_required(self):
+        self.auth(self.provider)
+        res = self.client.post(self.url(self.res.pk), {"expected_version": 1}, format="json")
+        self.assertEqual(res.status_code, 400, res.data)
+
+    def test_expected_version_required(self):
+        self.auth(self.provider)
+        res = self.client.post(self.url(self.res.pk), {"reason": "x"}, format="json")
+        self.assertEqual(res.status_code, 400, res.data)
+
+    def test_stale_version_rejected(self):
+        self.auth(self.provider)
+        res = self.reject(self.res.pk, 99)
+        self.assertEqual(res.status_code, 409, res.data)
+        self.assertIn("stale_version", error_codes(res))
+
+    def test_cannot_reject_non_pending(self):
+        self.res.status = ReservationStatus.ACCEPTED
+        self.res.save(update_fields=["status"])
+        self.auth(self.provider)
+        res = self.reject(self.res.pk, 1)
+        self.assertEqual(res.status_code, 409, res.data)
+        self.assertIn("invalid_transition", error_codes(res))
+
+    def test_double_reject_is_conflict(self):
+        self.auth(self.provider)
+        self.assertEqual(self.reject(self.res.pk, 1).status_code, 200)
+        # second attempt: now REJECTED and version bumped.
+        res = self.reject(self.res.pk, 2)
+        self.assertEqual(res.status_code, 409, res.data)
+        self.assertIn("invalid_transition", error_codes(res))
+
+
+class ReservationCancelTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.provider = make_user("can_provider@example.com")
+        self.receiver = make_user("can_receiver@example.com")
+        self.outsider = make_user("can_outsider@example.com")
+        self.admin = make_admin("can_admin@example.com")
+        self.listing = make_listing(self.provider, quantity_total=Decimal("20"))
+        self.res = make_claim_reservation(self.listing, self.receiver, quantity=Decimal("5"))
+
+    def auth(self, user):
+        self.client.force_authenticate(user)
+
+    def url(self, pk):
+        return f"/api/v1/reservations/{pk}/cancel/"
+
+    def cancel(self, pk, reason="Changed my mind."):
+        return self.client.post(self.url(pk), {"reason": reason}, format="json")
+
+    # --- participants can cancel while pending ---------------------------
+    def test_receiver_cancels_pending(self):
+        self.auth(self.receiver)
+        res = self.cancel(self.res.pk)
+        self.assertEqual(res.status_code, 200, res.data)
+        self.assertEqual(res.data["data"]["status"], ReservationStatus.CANCELLED)
+
+    def test_provider_cancels_pending(self):
+        self.auth(self.provider)
+        self.assertEqual(self.cancel(self.res.pk).status_code, 200)
+
+    def test_admin_cancels(self):
+        self.auth(self.admin)
+        self.assertEqual(self.cancel(self.res.pk).status_code, 200)
+
+    def test_outsider_gets_404(self):
+        self.auth(self.outsider)
+        self.assertEqual(self.cancel(self.res.pk).status_code, 404)
+
+    def test_cancel_requires_auth(self):
+        self.assertEqual(self.cancel(self.res.pk).status_code, 401)
+
+    def test_reason_required(self):
+        self.auth(self.receiver)
+        res = self.client.post(self.url(self.res.pk), {}, format="json")
+        self.assertEqual(res.status_code, 400, res.data)
+
+    def test_pending_cancel_keeps_quantity_and_source(self):
+        self.auth(self.receiver)
+        self.cancel(self.res.pk)
+        self.res.refresh_from_db()
+        self.listing.refresh_from_db()
+        self.assertEqual(self.res.quantity, Decimal("5"))
+        self.assertEqual(self.listing.status, ListingStatus.AVAILABLE)
+
+    # --- accepted cancel releases allocation -----------------------------
+    def _accept(self, reservation):
+        reservation.status = ReservationStatus.ACCEPTED
+        reservation.save(update_fields=["status"])
+
+    def test_cancel_accepted_releases_allocation_and_reopens_listing(self):
+        # Fully allocate so the listing is RESERVED, then cancel to reopen it.
+        full = make_claim_reservation(self.listing, self.receiver, quantity=Decimal("20"))
+        self._accept(full)
+        self.listing.status = ListingStatus.RESERVED
+        self.listing.save(update_fields=["status"])
+        self.auth(self.receiver)
+        res = self.cancel(full.pk)
+        self.assertEqual(res.status_code, 200, res.data)
+        self.listing.refresh_from_db()
+        self.assertEqual(self.listing.status, ListingStatus.AVAILABLE)
+
+    def test_cancel_accepted_does_not_reopen_closed_source(self):
+        full = make_claim_reservation(self.listing, self.receiver, quantity=Decimal("20"))
+        self._accept(full)
+        self.listing.status = ListingStatus.CLOSED
+        self.listing.save(update_fields=["status"])
+        self.auth(self.receiver)
+        res = self.cancel(full.pk)
+        self.assertEqual(res.status_code, 200, res.data)
+        self.listing.refresh_from_db()
+        self.assertEqual(self.listing.status, ListingStatus.CLOSED)
+
+    def test_cancel_accepted_cancels_scheduled_pickup(self):
+        self._accept(self.res)
+        pickup = make_pickup(self.res, status=PickupStatus.SCHEDULED)
+        self.auth(self.receiver)
+        res = self.cancel(self.res.pk)
+        self.assertEqual(res.status_code, 200, res.data)
+        pickup.refresh_from_db()
+        self.assertEqual(pickup.status, PickupStatus.CANCELLED)
+        self.assertIsNotNone(pickup.cancelled_at)
+
+    def test_cancel_accepted_leaves_no_show_pickup(self):
+        self._accept(self.res)
+        pickup = make_pickup(self.res, status=PickupStatus.NO_SHOW)
+        self.auth(self.receiver)
+        res = self.cancel(self.res.pk)
+        self.assertEqual(res.status_code, 200, res.data)
+        pickup.refresh_from_db()
+        self.assertEqual(pickup.status, PickupStatus.NO_SHOW)
+
+    def test_cannot_cancel_completed_pickup(self):
+        self._accept(self.res)
+        make_pickup(self.res, status=PickupStatus.COMPLETED)
+        self.auth(self.receiver)
+        res = self.cancel(self.res.pk)
+        self.assertEqual(res.status_code, 409, res.data)
+        self.assertIn("invalid_transition", error_codes(res))
+
+    def test_accepted_snapshot_preserved_on_cancel(self):
+        self._accept(self.res)
+        self.res.accepted_snapshot = {"title": "frozen"}
+        self.res.save(update_fields=["accepted_snapshot"])
+        self.auth(self.receiver)
+        self.cancel(self.res.pk)
+        self.res.refresh_from_db()
+        self.assertEqual(self.res.accepted_snapshot, {"title": "frozen"})
+
+    # --- invalid status / double submit ----------------------------------
+    def test_cannot_cancel_rejected(self):
+        self.res.status = ReservationStatus.REJECTED
+        self.res.save(update_fields=["status"])
+        self.auth(self.receiver)
+        res = self.cancel(self.res.pk)
+        self.assertEqual(res.status_code, 409, res.data)
+        self.assertIn("invalid_transition", error_codes(res))
+
+    def test_double_cancel_is_conflict(self):
+        self.auth(self.receiver)
+        self.assertEqual(self.cancel(self.res.pk).status_code, 200)
+        res = self.cancel(self.res.pk)
+        self.assertEqual(res.status_code, 409, res.data)
+        self.assertIn("invalid_transition", error_codes(res))

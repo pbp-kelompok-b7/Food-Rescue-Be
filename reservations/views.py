@@ -13,6 +13,8 @@ from .models import Reservation, ReservationStatus, SourceType
 from .serializers import (
     ListingClaimCreateSerializer,
     ReservationAcceptSerializer,
+    ReservationCancelSerializer,
+    ReservationRejectSerializer,
     RequestOfferCreateSerializer,
     ReservationReviseSerializer,
     ReservationSerializer,
@@ -234,16 +236,59 @@ def reservations_detail_accept(request, pk):
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def reservations_detail_reject(request, pk):
-    # TODO: implement this operation.
-    return failure('Endpoint belum diimplementasikan.', [{'field': None, 'code': 'not_implemented', 'message': 'Business logic pending.'}], status=501)
+    """Reject a PENDING reservation (section 7.4.7).
+
+    The approver decides: claim → provider, offer → receiver. Rejecting does not
+    change quantity; REJECTED is terminal. Only the reservation row is locked
+    (reject touches no allocation).
+    """
+    with transaction.atomic():
+        reservation = get_object_or_404(
+            Reservation.objects.select_for_update(of=("self",)), pk=pk
+        )
+        if request.user.id not in (reservation.provider_id, reservation.receiver_id):
+            # Hide existence from non-participants (privacy 404).
+            raise Http404
+        serializer = ReservationRejectSerializer(
+            data=request.data, reservation=reservation, user=request.user
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+    reservation.refresh_from_db()
+    data = ReservationSerializer(reservation, context={"viewer": request.user}).data
+    return success(data, message="Pengajuan ditolak")
 
 
 # POST /api/v1/reservations/<int:pk>/cancel/
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def reservations_detail_cancel(request, pk):
-    # TODO: implement this operation.
-    return failure('Endpoint belum diimplementasikan.', [{'field': None, 'code': 'not_implemented', 'message': 'Business logic pending.'}], status=501)
+    """Cancel a reservation and release any allocation (section 7.4.8).
+
+    Any participant or an admin may cancel while PENDING, or ACCEPTED with a
+    pickup not yet COMPLETED. The source row is locked first, then the
+    reservation, so allocation release and source-status recompute commit
+    together.
+    """
+    with transaction.atomic():
+        reservation, source = _lock_source_then_reservation(pk)
+        if not (
+            request.user.id in (reservation.provider_id, reservation.receiver_id)
+            or request.user.is_staff
+        ):
+            # Hide existence from non-participants (privacy 404).
+            raise Http404
+        serializer = ReservationCancelSerializer(
+            data=request.data,
+            reservation=reservation,
+            user=request.user,
+            source_obj=source,
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+    reservation.refresh_from_db()
+    data = ReservationSerializer(reservation, context={"viewer": request.user}).data
+    return success(data, message="Reservation dibatalkan")
 
 
 # GET /api/v1/admin/reservations/

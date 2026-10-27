@@ -9,6 +9,7 @@ from rest_framework.renderers import JSONRenderer
 
 from common.exceptions import BusinessConflict
 from listings.models import ListingStatus
+from pickups.models import PickupStatus
 from pickups.serializers import PickupSerializer
 from requests_app.models import RequestStatus
 from shared.enums import Mode, ResourceType, Suitability, Unit
@@ -664,5 +665,156 @@ class ReservationAcceptSerializer(serializers.Serializer):
             if fully_allocated and source.status == RequestStatus.OPEN:
                 source.status = RequestStatus.ALLOCATED
                 source.save(update_fields=["status", "updated_at"])
+
+        return reservation
+
+
+class ReservationRejectSerializer(serializers.Serializer):
+    """Reject a PENDING reservation (section 7.4.7).
+
+    The approver decides: a claim is rejected by the provider, an offer by the
+    receiver. Requires ``reason`` (1-1000) and ``expected_version`` (mismatch →
+    409 ``stale_version``). REJECTED is terminal and does not change quantity.
+    """
+
+    reason = serializers.CharField(min_length=1, max_length=1000)
+    expected_version = serializers.IntegerField()
+
+    def __init__(self, *args, reservation=None, user=None, **kwargs):
+        self.reservation = reservation
+        self.user = user
+        super().__init__(*args, **kwargs)
+
+    def validate(self, attrs):
+        reservation = self.reservation
+        user = self.user
+
+        if reservation.status != ReservationStatus.PENDING:
+            raise BusinessConflict(
+                "Only a pending reservation can be rejected.",
+                code="invalid_transition",
+            )
+
+        # Approver = provider for a claim, receiver for an offer.
+        if reservation.source_type == SourceType.LISTING_CLAIM:
+            approver_id = reservation.provider_id
+        else:
+            approver_id = reservation.receiver_id
+        if user.id != approver_id:
+            raise BusinessConflict(
+                "You are not allowed to reject this reservation.",
+                code="invalid_transition",
+            )
+
+        if attrs["expected_version"] != reservation.version:
+            raise BusinessConflict(
+                f"Reservation has changed; current version is {reservation.version}.",
+                code="stale_version",
+            )
+        return attrs
+
+    def save(self):
+        reservation = self.reservation
+        reservation.status = ReservationStatus.REJECTED
+        reservation.reason = self.validated_data["reason"]
+        reservation.version = reservation.version + 1
+        reservation.save(update_fields=["status", "reason", "version", "updated_at"])
+        return reservation
+
+
+class ReservationCancelSerializer(serializers.Serializer):
+    """Cancel a reservation and release any allocation (section 7.4.8 / 5.4).
+
+    Any participant (provider or receiver) or an admin may cancel while the
+    reservation is PENDING, or ACCEPTED with a pickup that is not yet COMPLETED.
+    ``reason`` is required. The transaction parties, price, and accepted
+    snapshot are preserved.
+
+    Cancelling an ACCEPTED reservation releases its allocation exactly once
+    (achieved by flipping the status to CANCELLED, since allocation is computed
+    as the sum of ACCEPTED quantities), recomputes the source status (reopening
+    it only if the source is still active and before its deadline), and flips a
+    SCHEDULED pickup to CANCELLED. A NO_SHOW pickup is left untouched.
+
+    The source row must already be locked by the view (lock order: source then
+    reservation).
+    """
+
+    reason = serializers.CharField(min_length=1, max_length=1000)
+
+    def __init__(self, *args, reservation=None, user=None, source_obj=None, **kwargs):
+        self.reservation = reservation
+        self.user = user
+        self.source_obj = source_obj
+        super().__init__(*args, **kwargs)
+
+    def validate(self, attrs):
+        reservation = self.reservation
+        user = self.user
+
+        # Participant or admin only.
+        is_participant = user.id in (reservation.provider_id, reservation.receiver_id)
+        if not (is_participant or user.is_staff):
+            # Non-participants should not learn the reservation exists; the view
+            # hides it with 404, but guard here too.
+            raise BusinessConflict(
+                "You are not allowed to cancel this reservation.",
+                code="invalid_transition",
+            )
+
+        if reservation.status not in (
+            ReservationStatus.PENDING, ReservationStatus.ACCEPTED
+        ):
+            raise BusinessConflict(
+                "This reservation can no longer be cancelled.",
+                code="invalid_transition",
+            )
+
+        # An ACCEPTED reservation whose pickup already COMPLETED is a finished
+        # transaction and cannot be cancelled.
+        pickup = getattr(reservation, "pickup", None)
+        if (
+            reservation.status == ReservationStatus.ACCEPTED
+            and pickup is not None
+            and pickup.status == PickupStatus.COMPLETED
+        ):
+            raise BusinessConflict(
+                "A completed pickup cannot be cancelled.", code="invalid_transition"
+            )
+
+        attrs["_pickup"] = pickup
+        attrs["_was_accepted"] = reservation.status == ReservationStatus.ACCEPTED
+        return attrs
+
+    def save(self):
+        reservation = self.reservation
+        source = self.source_obj
+        pickup = self.validated_data["_pickup"]
+        was_accepted = self.validated_data["_was_accepted"]
+        now = timezone.now()
+
+        reservation.status = ReservationStatus.CANCELLED
+        reservation.reason = self.validated_data["reason"]
+        reservation.version = reservation.version + 1
+        reservation.save(update_fields=["status", "reason", "version", "updated_at"])
+
+        # Flip a SCHEDULED pickup to CANCELLED; leave NO_SHOW/COMPLETED as-is.
+        if pickup is not None and pickup.status == PickupStatus.SCHEDULED:
+            pickup.status = PickupStatus.CANCELLED
+            pickup.cancelled_at = now
+            pickup.save(update_fields=["status", "cancelled_at", "updated_at"])
+
+        # Releasing allocation happens implicitly: the reservation is no longer
+        # ACCEPTED, so it stops counting toward the source's allocation. Recompute
+        # and reopen the source only if it is still active and before its deadline.
+        if was_accepted:
+            if reservation.source_type == SourceType.LISTING_CLAIM:
+                if source.status == ListingStatus.RESERVED and source.available_until > now:
+                    source.status = ListingStatus.AVAILABLE
+                    source.save(update_fields=["status", "updated_at"])
+            else:
+                if source.status == RequestStatus.ALLOCATED and source.valid_until > now:
+                    source.status = RequestStatus.OPEN
+                    source.save(update_fields=["status", "updated_at"])
 
         return reservation
