@@ -16,10 +16,11 @@ class Pickup(VersionedModel):
     reservation = models.OneToOneField("reservations.Reservation", on_delete=models.PROTECT, related_name="pickup")
     scheduled_at = models.DateTimeField()
     location = models.JSONField(default=dict)
-    instructions = models.TextField(blank=True)
+    instructions = models.TextField(null=True, blank=True)
     status = models.CharField(max_length=12, choices=PickupStatus.choices, default=PickupStatus.SCHEDULED)
     completed_at = models.DateTimeField(null=True, blank=True)
     no_show_at = models.DateTimeField(null=True, blank=True)
-
+    cancelled_at = models.DateTimeField(null=True, blank=True)
+    
     class Meta:
         ordering = ["-scheduled_at", "-pk"]
