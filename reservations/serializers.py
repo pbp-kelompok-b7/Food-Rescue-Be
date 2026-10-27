@@ -32,6 +32,24 @@ def _decimal_str(value, places):
     return str(Decimal(value).quantize(quantum))
 
 
+class StrictFieldsMixin:
+    """Reject unknown / read-only fields with 400 (contract section 7.0).
+
+    The contract states requests must not send server-owned or unknown fields;
+    doing so is a validation error rather than silently ignored.
+    """
+
+    def to_internal_value(self, data):
+        if isinstance(data, dict):
+            allowed = set(self.fields)
+            unknown = [key for key in data if key not in allowed]
+            if unknown:
+                raise serializers.ValidationError(
+                    {key: ["Unknown or read-only field."] for key in sorted(unknown)}
+                )
+        return super().to_internal_value(data)
+
+
 class UserRefSerializer(serializers.Serializer):
     """Minimal user reference used in reservation responses (section 7.4)."""
 
@@ -187,7 +205,7 @@ class AdminReservationSerializer(ReservationSerializer):
         return _contact_of(obj.receiver)
 
 
-class ListingClaimCreateSerializer(serializers.Serializer):
+class ListingClaimCreateSerializer(StrictFieldsMixin, serializers.Serializer):
     """Validate and create a PENDING ``LISTING_CLAIM`` reservation
     (Technical Design & API Contract Rev 2 section 7.4.1).
 
@@ -285,7 +303,7 @@ OFFER_RESOURCE_KEYS = (
 )
 
 
-class RequestOfferCreateSerializer(serializers.Serializer):
+class RequestOfferCreateSerializer(StrictFieldsMixin, serializers.Serializer):
     """Validate and create a PENDING ``REQUEST_OFFER`` reservation
     (Technical Design & API Contract Rev 2 section 7.4.2).
 
@@ -435,7 +453,7 @@ class RequestOfferCreateSerializer(serializers.Serializer):
         )
 
 
-class ReservationReviseSerializer(serializers.Serializer):
+class ReservationReviseSerializer(StrictFieldsMixin, serializers.Serializer):
     """Revise the quantity of a PENDING reservation (section 7.4.5).
 
     Only the submitter may revise, and only ``quantity`` is mutable. Price,
@@ -564,7 +582,7 @@ def _offer_terms_mismatches(reservation, req):
     return sorted(set(mismatches))
 
 
-class ReservationAcceptSerializer(serializers.Serializer):
+class ReservationAcceptSerializer(StrictFieldsMixin, serializers.Serializer):
     """Accept a PENDING reservation, atomically (section 7.4.6 / 5.1-5.3).
 
     Claim approver = provider; offer approver = receiver. The caller must send
@@ -679,12 +697,25 @@ class ReservationAcceptSerializer(serializers.Serializer):
         attrs["_total"] = total
         attrs["_allocated_after"] = allocated + reservation.quantity
         attrs["_now"] = now
+        # For a claim the resource deadline is owned by the listing, which may
+        # have been edited since the claim was submitted. Re-sync it from the
+        # locked listing so the frozen snapshot uses the deadline that was
+        # actually re-checked above (section 5.3 / 7.4.6). An offer carries its
+        # own provider-set deadline, so it is left unchanged.
+        if reservation.source_type == SourceType.LISTING_CLAIM:
+            attrs["_resource_deadline"] = source.available_until
+        else:
+            attrs["_resource_deadline"] = reservation.resource_deadline
         return attrs
 
     def save(self):
         reservation = self.reservation
         source = self.source_obj
         now = self.validated_data["_now"]
+
+        # Align the reservation's resource deadline with the locked source
+        # before snapshotting (claims follow the listing's current deadline).
+        reservation.resource_deadline = self.validated_data["_resource_deadline"]
 
         # Capture the immutable snapshot of the agreed terms (same shape as the
         # response ``terms``). The submitted price is preserved as-is. The terms
@@ -698,7 +729,8 @@ class ReservationAcceptSerializer(serializers.Serializer):
         reservation.accepted_snapshot = snapshot
         reservation.version = reservation.version + 1
         update_fields = [
-            "status", "accepted_at", "accepted_snapshot", "version", "updated_at"
+            "status", "accepted_at", "accepted_snapshot", "resource_deadline",
+            "version", "updated_at",
         ]
         reason = self.validated_data.get("reason")
         if reason:
@@ -721,7 +753,7 @@ class ReservationAcceptSerializer(serializers.Serializer):
         return reservation
 
 
-class ReservationRejectSerializer(serializers.Serializer):
+class ReservationRejectSerializer(StrictFieldsMixin, serializers.Serializer):
     """Reject a PENDING reservation (section 7.4.7).
 
     The approver decides: a claim is rejected by the provider, an offer by the
@@ -778,7 +810,7 @@ class ReservationRejectSerializer(serializers.Serializer):
         return reservation
 
 
-class ReservationCancelSerializer(serializers.Serializer):
+class ReservationCancelSerializer(StrictFieldsMixin, serializers.Serializer):
     """Cancel a reservation and release any allocation (section 7.4.8 / 5.4).
 
     Any participant (provider or receiver) or an admin may cancel while the

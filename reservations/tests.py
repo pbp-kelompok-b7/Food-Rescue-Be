@@ -3,6 +3,7 @@ from decimal import Decimal
 from django.contrib.auth import get_user_model
 from django.test import TestCase
 from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 from datetime import timedelta
 from rest_framework.test import APIClient
 
@@ -104,6 +105,8 @@ class ListingClaimTests(TestCase):
 
     # --- Client cannot forge protected fields -----------------------------
     def test_client_cannot_override_price_owner_status(self):
+        # Server-owned / unknown fields are rejected (400), not silently
+        # ignored (contract section 7.0).
         self.auth(self.receiver)
         res = self.client.post(
             self.url(self.listing.pk),
@@ -116,8 +119,13 @@ class ListingClaimTests(TestCase):
             },
             format="json",
         )
-        self.assertEqual(res.status_code, 201, res.data)
-        data = res.data["data"]
+        self.assertEqual(res.status_code, 400, res.data)
+        fields = {e["field"] for e in res.data["errors"]}
+        self.assertTrue({"unit_price", "provider", "status", "mode"} <= fields)
+        # A clean claim (only quantity) still derives price/owner/status server-side.
+        clean = self.client.post(self.url(self.listing.pk), {"quantity": "3"}, format="json")
+        self.assertEqual(clean.status_code, 201, clean.data)
+        data = clean.data["data"]
         self.assertEqual(Decimal(data["terms"]["unit_price"]), self.listing.unit_price)
         self.assertEqual(data["provider"]["id"], self.provider.id)
         self.assertEqual(data["status"], ReservationStatus.PENDING)
@@ -643,6 +651,13 @@ class ReservationInboxTests(TestCase):
         results = self.client.get("/api/v1/reservations/").data["data"]["results"]
         self.assertEqual([r["id"] for r in results], [second.pk, self.res.pk])
 
+    def test_out_of_range_page_uses_page_not_found_code(self):
+        # [P3] contract section 7.4.3 expects code page_not_found, not not_found.
+        self.auth(self.receiver)
+        res = self.client.get("/api/v1/reservations/?page=999")
+        self.assertEqual(res.status_code, 404)
+        self.assertIn("page_not_found", [e["code"] for e in res.data["errors"]])
+
 
 class ReservationDetailTests(TestCase):
     def setUp(self):
@@ -793,6 +808,7 @@ class ReservationReviseTests(TestCase):
 
     # --- immutability -----------------------------------------------------
     def test_price_and_parties_not_revisable(self):
+        # Attempting to revise price/mode/parties sends unknown fields -> 400.
         self.auth(self.receiver)
         res = self.patch(
             self.res.pk,
@@ -804,8 +820,13 @@ class ReservationReviseTests(TestCase):
                 "provider": self.receiver.id,
             },
         )
-        self.assertEqual(res.status_code, 200, res.data)
-        data = res.data["data"]
+        self.assertEqual(res.status_code, 400, res.data)
+        fields = {e["field"] for e in res.data["errors"]}
+        self.assertTrue({"unit_price", "mode", "provider"} <= fields)
+        # A clean quantity-only revise succeeds and leaves price/mode/parties intact.
+        ok = self.patch(self.res.pk, {"quantity": "6", "expected_version": 1})
+        self.assertEqual(ok.status_code, 200, ok.data)
+        data = ok.data["data"]
         self.assertEqual(Decimal(data["terms"]["unit_price"]), self.listing.unit_price)
         self.assertEqual(data["terms"]["mode"], self.listing.mode)
         self.assertEqual(data["provider"]["id"], self.provider.id)
@@ -875,6 +896,21 @@ class ReservationAcceptTests(TestCase):
         self.assertEqual(res.status_code, 200, res.data)
         self.listing.refresh_from_db()
         self.assertEqual(self.listing.status, ListingStatus.RESERVED)
+
+    def test_accept_resyncs_shortened_listing_deadline(self):
+        # [P1] If the listing deadline is shortened before acceptance, the
+        # accepted reservation + snapshot must freeze the NEW (re-checked)
+        # deadline, not the stale one captured at claim time.
+        new_deadline = timezone.now() + timedelta(hours=1)
+        self.listing.available_until = new_deadline
+        self.listing.save(update_fields=["available_until"])
+        self.auth(self.provider)
+        res = self.accept(self.res.pk, 1)
+        self.assertEqual(res.status_code, 200, res.data)
+        self.res.refresh_from_db()
+        self.assertEqual(self.res.resource_deadline, new_deadline)
+        snap_deadline = res.data["data"]["accepted_snapshot"]["resource_deadline"]
+        self.assertEqual(parse_datetime(snap_deadline), new_deadline)
 
     def test_snapshot_immutable_against_source_edit(self):
         self.auth(self.provider)
