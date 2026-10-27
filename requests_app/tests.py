@@ -919,3 +919,389 @@ class RequestLifecycleConcurrencyTests(TransactionTestCase):
             self.assertEqual([f.result(timeout=15) for f in futures], [204, 204])
         self.assertEqual(AuditEvent.objects.filter(entity_type="ResourceRequest", action="archive").count(), 1)
         self.assertEqual(Reservation.objects.filter(request=self.source).count(), 1)
+
+
+class RequestModerationTests(TestCase):
+    url = "/api/v1/admin/requests/"
+    make_request = RequestReadTests.make_request
+    offer = RequestReadTests.offer
+
+    @classmethod
+    def setUpTestData(cls):
+        users = get_user_model().objects
+        cls.owner = users.create_user(email="owner@example.com", display_name="Owner", whatsapp_number="+6281234567890")
+        cls.provider = users.create_user(email="provider@example.com", display_name="Provider", whatsapp_number="+6281234567891")
+        cls.admin = users.create_user(email="admin@example.com", display_name="Moderator", is_staff=True)
+        cls.inactive = users.create_user(email="inactive@example.com", display_name="Inactive", is_active=False)
+
+    def setUp(self):
+        self.now = timezone.now()
+        self.client = APIClient()
+        self.client.force_authenticate(self.admin)
+        self.body = {
+            "resource_type": "PACKAGED_FOOD_SURPLUS", "category": "prepared_meal",
+            "intended_use": "HUMAN_CONSUMPTION", "quantity_needed": "20.000", "unit": "box",
+            "location": {"label": "Kampus UI", "area": "Depok", "latitude": -6.36, "longitude": 106.82},
+            "valid_until": (self.now + timedelta(days=1)).isoformat(),
+            "owner_id": self.owner.pk, "reason": "Moderator correction",
+        }
+
+    def detail_url(self, source):
+        return f"{self.url}{source.pk}/"
+
+    def edit(self, source, data):
+        return self.client.patch(self.detail_url(source), data, format="json")
+
+    def close(self, source, data=None):
+        return self.client.post(self.detail_url(source) + "close/",
+                                {"reason": "Moderator closure"} if data is None else data, format="json")
+
+    def delete(self, source, data=None):
+        return self.client.delete(self.detail_url(source),
+                                  {"reason": "Moderator removal"} if data is None else data, format="json")
+
+    def test_all_six_operations_require_active_admin(self):
+        source = self.make_request()
+        for user, status in ((None, 401), (self.owner, 403), (self.inactive, 401)):
+            self.client.force_authenticate(user)
+            responses = [self.client.get(self.url), self.client.get(self.detail_url(source)),
+                         self.client.post(self.url, self.body, format="json"),
+                         self.edit(source, {"quantity_needed": "25", "reason": "Correction"}),
+                         self.close(source), self.delete(source)]
+            for response in responses:
+                self.assertEqual(response.status_code, status, response.data)
+        source.refresh_from_db()
+        self.assertEqual(source.version, 1)
+        self.assertEqual(AuditEvent.objects.count(), 0)
+        self.assertEqual(ResourceRequest.objects.count(), 1)
+        self.admin.is_active = False
+        self.client.force_authenticate(self.admin)
+        self.assertEqual(self.client.get(self.url).status_code, 401)
+
+    def test_list_detail_include_every_status_expired_and_archived_without_contact(self):
+        sources = [self.make_request(status=status, archived_at=self.now,
+                                     valid_until=self.now - timedelta(days=1)) for status in RequestStatus.values]
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual({r["id"] for r in response.data["data"]["results"]}, {r.pk for r in sources})
+        for source in sources:
+            response = self.client.get(self.detail_url(source))
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.data["data"]["owner"], {"id": self.owner.pk, "display_name": "Owner"})
+            self.assertNotIn("whatsapp", str(response.data))
+            self.assertNotIn("email", str(response.data))
+        self.assertEqual(AuditEvent.objects.count(), 0)
+        self.assertTrue(all(v == 1 for v in ResourceRequest.objects.values_list("version", flat=True)))
+
+    def test_admin_filters_and_pagination(self):
+        target = self.make_request(status="CLOSED", archived_at=self.now)
+        self.make_request(owner=self.provider, status="EXPIRED")
+        filters = {"q": "kampus", "resource_type": "PACKAGED_FOOD_SURPLUS", "category": "prepared_meal",
+                   "intended_use": "HUMAN_CONSUMPTION", "area": "DEPOK", "donate_only": "true",
+                   "status": "CLOSED", "owner_id": self.owner.pk, "archived": "true"}
+        response = self.client.get(self.url, filters)
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual([r["id"] for r in response.data["data"]["results"]], [target.pk])
+        self.assertEqual(self.client.get(self.url, {"archived": "false"}).data["data"]["count"], 1)
+        self.assertEqual(self.client.get(self.url, {"owner_id": 999999}).data["data"]["count"], 0)
+        for ordering in ("created_at", "-created_at", "valid_until", "-valid_until"):
+            response = self.client.get(self.url, {"ordering": ordering, "page_size": 1})
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(len(response.data["data"]["results"]), 1)
+            self.assertIsNotNone(response.data["data"]["next"])
+        for page in (0, -1, 9):
+            response = self.client.get(self.url, {"page": page})
+            self.assertEqual(response.status_code, 404)
+            self.assertEqual(response.data["errors"][0]["code"], "page_not_found")
+        for query in ({"owner_id": 0}, {"owner_id": "1.0"}, {"owner_id": "9" * 30}, {"archived": "yes"},
+                      {"scope": "mine"}, {"status": "INVALID"}, {"page_size": 101}, {"unknown": 1}):
+            self.assertEqual(self.client.get(self.url, query).status_code, 400)
+        self.assertEqual(self.client.get(self.url + "?owner_id=1&owner_id=2").status_code, 400)
+
+    def test_create_on_behalf_separates_owner_creator_and_audits(self):
+        response = self.client.post(self.url, self.body, format="json")
+        self.assertEqual(response.status_code, 201, response.data)
+        source = ResourceRequest.objects.get(pk=response.data["data"]["id"])
+        self.assertEqual((source.owner_id, source.created_by_id), (self.owner.pk, self.admin.pk))
+        self.assertFalse(source.donate_only)
+        self.assertIsNone(source.max_unit_price)
+        self.assertEqual(response.data["data"]["quantity_remaining"], "20.000")
+        audit = AuditEvent.objects.get()
+        self.assertEqual((audit.actor_id, audit.action), (self.admin.pk, "create"))
+        self.assertEqual(audit.summary["reason"], self.body["reason"])
+        self.assertIsNone(audit.summary["before"])
+        self.assertEqual(audit.summary["after"]["owner"]["id"], self.owner.pk)
+        self.assertEqual(audit.summary["after"]["created_by_id"], self.admin.pk)
+        self.assertNotIn(self.owner.whatsapp_number, str(audit.summary))
+
+    def test_create_owner_missing_inactive_invalid_and_required(self):
+        for owner, status, code in ((999999, 404, "not_found"), (self.inactive.pk, 409, "owner_inactive"),
+                                    (0, 400, None), (True, 400, None), (1.0, 400, None), ("9" * 30, 400, None)):
+            response = self.client.post(self.url, {**self.body, "owner_id": owner}, format="json")
+            self.assertEqual(response.status_code, status, response.data)
+            if code:
+                self.assertEqual(response.data["errors"][0]["code"], code)
+        for missing in self.body:
+            body = {k: v for k, v in self.body.items() if k != missing}
+            self.assertEqual(self.client.post(self.url, body, format="json").status_code, 400)
+        self.assertEqual(ResourceRequest.objects.count(), 0)
+        self.assertEqual(AuditEvent.objects.count(), 0)
+
+    def test_create_uses_owner_resource_quantity_price_location_and_deadline_rules(self):
+        for changes in ({"category": "coffee_grounds"}, {"intended_use": "COMPOSTING"},
+                        {"quantity_needed": "0"}, {"quantity_needed": "1.1"}, {"quantity_needed": 2},
+                        {"donate_only": True, "max_unit_price": "1.00"}, {"donate_only": "true"},
+                        {"max_unit_price": "-1"}, {"location": {}}, {"valid_until": self.now.isoformat()},
+                        {"status": "CLOSED"}, {"created_by": self.owner.pk}, {"owner": self.owner.pk}):
+            response = self.client.post(self.url, {**self.body, **changes}, format="json")
+            self.assertEqual(response.status_code, 400, response.data)
+        self.assertEqual(ResourceRequest.objects.count(), 0)
+
+    def test_reason_required_typed_bounded_on_all_writes_including_partial_patch(self):
+        source = self.make_request()
+        for reason in (None, "", "   ", 42, "x" * 1001):
+            self.assertEqual(self.client.post(self.url, {**self.body, "reason": reason}, format="json").status_code, 400)
+            self.assertEqual(self.edit(source, {"quantity_needed": "25", "reason": reason}).status_code, 400)
+            self.assertEqual(self.close(source, {"reason": reason}).status_code, 400)
+            self.assertEqual(self.delete(source, {"reason": reason}).status_code, 400)
+        self.assertEqual(self.edit(source, {"quantity_needed": "25"}).status_code, 400)
+        self.assertEqual(self.edit(source, {"reason": "Correction only"}).status_code, 400)
+        self.assertEqual(self.close(source, {}).status_code, 400)
+        self.assertEqual(self.delete(source, {}).status_code, 400)
+        self.assertEqual(self.client.delete(self.detail_url(source)).status_code, 400)
+        source.refresh_from_db()
+        self.assertEqual(source.version, 1)
+        self.assertEqual(AuditEvent.objects.count(), 0)
+        self.assertEqual(self.edit(source, {"quantity_needed": "25", "reason": "x" * 1000}).status_code, 200)
+
+    def test_patch_audits_before_after_and_keeps_owner_creator_and_accepted_snapshot(self):
+        source = self.make_request()
+        accepted = self.offer(source, "5", accepted_snapshot={"unit": "box", "location": source.location})
+        before_reservation = Reservation.objects.values().get(pk=accepted.pk)
+        response = self.edit(source, {"quantity_needed": "25", "donate_only": False,
+                                      "max_unit_price": "500.00", "reason": "Preference correction"})
+        self.assertEqual(response.status_code, 200, response.data)
+        source.refresh_from_db()
+        self.assertEqual((source.owner_id, source.created_by_id), (self.owner.pk, self.owner.pk))
+        self.assertEqual(Reservation.objects.values().get(pk=accepted.pk), before_reservation)
+        self.assertEqual(response.data["data"]["quantity_remaining"], "20.000")
+        audit = AuditEvent.objects.get(action="update")
+        self.assertEqual(audit.summary["before"]["quantity_needed"], "20.000")
+        self.assertEqual(audit.summary["after"]["quantity_needed"], "25.000")
+        self.assertEqual(audit.summary["after"]["version"], 2)
+        self.assertEqual(audit.summary["reason"], "Preference correction")
+        for field in ("owner_id", "created_by", "status", "quantity_allocated", "accepted_snapshot"):
+            self.assertEqual(self.edit(source, {field: 1, "reason": "Correction"}).status_code, 400)
+
+    def test_patch_quantity_floor_and_resource_locks_are_atomic(self):
+        source = self.make_request()
+        self.offer(source, "5")
+        self.offer(source, "3", pickup_status="COMPLETED")
+        before = ResourceRequest.objects.values().get(pk=source.pk)
+        for changes, code in (({"quantity_needed": "7"}, "quantity_floor"), ({"unit": "kg"}, "unit_locked"),
+                              ({"category": "bakery"}, "unit_locked"),
+                              ({"resource_type": "COMPOSTABLE_FOOD_WASTE"}, "unit_locked"),
+                              ({"intended_use": "COMPOSTING"}, "unit_locked")):
+            response = self.edit(source, {**changes, "reason": "Correction"})
+            self.assertEqual(response.status_code, 409, response.data)
+            self.assertEqual(response.data["errors"][0]["code"], code)
+            self.assertEqual(ResourceRequest.objects.values().get(pk=source.pk), before)
+        self.assertEqual(AuditEvent.objects.count(), 0)
+        response = self.edit(source, {"quantity_needed": "8", "reason": "Correction"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["data"]["status"], "ALLOCATED")
+
+    def test_patch_terminal_and_archived_records_does_not_reopen(self):
+        for status in ("CLOSED", "EXPIRED", "FULFILLED"):
+            source = self.make_request(status=status, archived_at=self.now)
+            response = self.edit(source, {"quantity_needed": "25", "reason": "History correction"})
+            self.assertEqual(response.status_code, 200)
+            source.refresh_from_db()
+            self.assertEqual(source.status, status)
+            self.assertIsNotNone(source.archived_at)
+
+    def test_close_and_archive_preserve_accepted_reservation_pickup_and_history(self):
+        for action in (self.close, self.delete):
+            source = self.make_request()
+            pending = self.offer(source, "1", status="PENDING")
+            accepted = self.offer(source, "5", pickup_status="SCHEDULED", accepted_snapshot={"quantity": "5.000"})
+            accepted_before = Reservation.objects.values().get(pk=accepted.pk)
+            pickup_before = Pickup.objects.values().get(reservation=accepted)
+            response = action(source)
+            self.assertEqual(response.status_code, 200 if action == self.close else 204, response.data)
+            source.refresh_from_db()
+            pending.refresh_from_db()
+            self.assertEqual(source.status, "CLOSED")
+            self.assertEqual((pending.status, pending.cancellation_code), ("CANCELLED", "SOURCE_CLOSED"))
+            self.assertEqual(Reservation.objects.values().get(pk=accepted.pk), accepted_before)
+            self.assertEqual(Pickup.objects.values().get(reservation=accepted), pickup_before)
+            audit = AuditEvent.objects.get(entity_type="ResourceRequest", entity_id=str(source.pk))
+            self.assertEqual(audit.actor_id, self.admin.pk)
+            self.assertEqual(audit.summary["before"]["status"], "OPEN")
+            self.assertEqual(audit.summary["after"]["status"], "CLOSED")
+            self.assertEqual(audit.summary["after"]["quantity_allocated"], "5.000")
+            self.assertEqual(pending.reason, audit.summary["reason"])
+            self.client.force_authenticate(self.owner)
+            self.assertEqual(self.client.get(f"/api/v1/requests/{source.pk}/").status_code, 200)
+            self.client.force_authenticate(self.admin)
+            if action == self.delete:
+                self.assertEqual(response.content, b"")
+                count = AuditEvent.objects.count()
+                self.assertEqual(self.delete(source).status_code, 204)
+                self.assertEqual(AuditEvent.objects.count(), count)
+
+    def test_hard_delete_and_archive_with_rejected_cancelled_history(self):
+        source = self.make_request()
+        pk = source.pk
+        response = self.delete(source)
+        self.assertEqual(response.status_code, 204)
+        self.assertEqual(response.content, b"")
+        self.assertFalse(ResourceRequest.objects.filter(pk=pk).exists())
+        audit = AuditEvent.objects.get(entity_type="ResourceRequest", entity_id=str(pk))
+        self.assertEqual(audit.summary["reason"], "Moderator removal")
+        self.assertIsNone(audit.summary["after"])
+        for status in ("REJECTED", "CANCELLED"):
+            source = self.make_request(status="EXPIRED")
+            self.offer(source, "1", status=status)
+            self.assertEqual(self.delete(source).status_code, 204)
+            source.refresh_from_db()
+            self.assertEqual(source.status, "EXPIRED")
+            self.assertIsNotNone(source.archived_at)
+            self.assertEqual(source.reservations.count(), 1)
+
+    def test_close_terminal_or_fully_fulfilled_returns_409_without_audit(self):
+        for status in ("CLOSED", "EXPIRED", "FULFILLED"):
+            response = self.close(self.make_request(status=status))
+            self.assertEqual(response.status_code, 409)
+        source = self.make_request()
+        self.offer(source, "20", pickup_status="COMPLETED")
+        self.assertEqual(self.close(source).status_code, 409)
+        self.assertEqual(AuditEvent.objects.count(), 0)
+
+    def test_all_admin_writes_require_real_session_csrf(self):
+        source = self.make_request()
+        self.client = APIClient(enforce_csrf_checks=True)
+        self.client.force_login(self.admin)
+        responses = [self.client.post(self.url, self.body, format="json"),
+                     self.edit(source, {"quantity_needed": "25", "reason": "Correction"}),
+                     self.close(source), self.delete(source)]
+        for response in responses:
+            self.assertEqual(response.status_code, 403)
+            self.assertEqual(response.data["errors"][0]["code"], "csrf_failed")
+        self.assertEqual(AuditEvent.objects.count(), 0)
+        csrf = self.client.get("/api/v1/auth/csrf/")
+        self.client.credentials(HTTP_X_CSRFTOKEN=csrf.data["data"]["csrf_token"])
+        self.assertEqual(self.client.post(self.url, self.body, format="json").status_code, 201)
+        self.assertEqual(self.edit(source, {"quantity_needed": "25", "reason": "Correction"}).status_code, 200)
+        self.assertEqual(self.close(source).status_code, 200)
+        self.assertEqual(self.delete(source).status_code, 204)
+
+    def test_invalid_ids_bodies_unknown_fields_and_json_parser(self):
+        for pk in ("0", "-1", "abc", "9" * 30):
+            url = f"{self.url}{pk}/"
+            for response in (self.client.get(url), self.client.patch(url, {"reason": "r"}, format="json"),
+                             self.client.delete(url, {"reason": "r"}, format="json"),
+                             self.client.post(url + "close/", {"reason": "r"}, format="json")):
+                self.assertEqual(response.status_code, 400, response.data)
+        url = self.url + "999999/"
+        self.assertEqual(self.client.get(url).status_code, 404)
+        self.assertEqual(self.client.patch(url, {"quantity_needed": "25", "reason": "r"}, format="json").status_code, 404)
+        self.assertEqual(self.client.delete(url, {"reason": "r"}, format="json").status_code, 404)
+        self.assertEqual(self.client.post(url + "close/", {"reason": "r"}, format="json").status_code, 404)
+        source = self.make_request()
+        for body in ([], "text", 42, None):
+            for method, target in (("POST", self.url), ("PATCH", self.detail_url(source)),
+                                   ("DELETE", self.detail_url(source)), ("POST", self.detail_url(source) + "close/")):
+                response = self.client.generic(method, target, json.dumps(body), content_type="application/json")
+                self.assertEqual(response.status_code, 400, response.data)
+        for action in (self.close, self.delete):
+            self.assertEqual(action(source, {"reason": "r", "unknown": 1}).status_code, 400)
+        self.assertEqual(self.client.generic("POST", self.url, "{", content_type="application/json").status_code, 400)
+        self.assertEqual(self.client.generic("POST", self.url, "quantity_needed=20", content_type="application/x-www-form-urlencoded").status_code, 415)
+
+    def test_audit_failure_rolls_back_every_admin_write(self):
+        source = self.make_request()
+        self.offer(source, "1", status="PENDING")
+        empty = self.make_request()
+        operations = [lambda: self.client.post(self.url, self.body, format="json"),
+                      lambda: self.edit(source, {"quantity_needed": "25", "reason": "r"}),
+                      lambda: self.close(source), lambda: self.delete(source), lambda: self.delete(empty)]
+        for operation in operations:
+            before = list(ResourceRequest.objects.values())
+            offers = list(Reservation.objects.values())
+            with patch("requests_app.views._audit", side_effect=RuntimeError("Audit unavailable")):
+                with self.assertLogs("common.exceptions", level="ERROR"):
+                    self.assertEqual(operation().status_code, 500)
+            self.assertEqual(list(ResourceRequest.objects.values()), before)
+            self.assertEqual(list(Reservation.objects.values()), offers)
+            self.assertEqual(AuditEvent.objects.count(), 0)
+
+    def test_accepted_pickup_can_be_scheduled_after_admin_close_or_archive(self):
+        for action in (self.close, self.delete):
+            source = self.make_request()
+            accepted = self.offer(source, "5", accepted_snapshot={"location": source.location})
+            action(source)
+            self.client.force_authenticate(self.provider)
+            response = self.client.post(f"/api/v1/reservations/{accepted.pk}/pickup/",
+                                        {"scheduled_at": (self.now + timedelta(hours=1)).isoformat()}, format="json")
+            self.assertEqual(response.status_code, 201, response.data)
+            self.client.force_authenticate(self.admin)
+
+
+@skipUnlessDBFeature("has_select_for_update")
+class RequestModerationConcurrencyTests(TransactionTestCase):
+    make_request = RequestReadTests.make_request
+    offer = RequestReadTests.offer
+
+    def setUp(self):
+        self.now = timezone.now()
+        self.owner = get_user_model().objects.create_user(email="owner@example.com", display_name="Owner")
+        self.provider = get_user_model().objects.create_user(email="provider@example.com", display_name="Provider")
+        self.admin = get_user_model().objects.create_user(email="admin@example.com", display_name="Admin", is_staff=True)
+        self.source = self.make_request()
+
+    def action(self, method, ready, quantity="25"):
+        close_old_connections()
+        try:
+            client = APIClient()
+            client.force_authenticate(self.admin)
+            ready()
+            url = f"/api/v1/admin/requests/{self.source.pk}/"
+            if method == "close":
+                response = client.post(url + "close/", {"reason": "Moderation"}, format="json")
+            elif method == "edit":
+                response = client.patch(url, {"quantity_needed": quantity, "reason": "Correction"}, format="json")
+            else:
+                response = client.delete(url, {"reason": "Removal"}, format="json")
+            return response.status_code
+        finally:
+            connection.close()
+
+    def test_simultaneous_admin_close_audits_once(self):
+        barrier = Barrier(2)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(self.action, "close", lambda: barrier.wait(timeout=5)) for _ in range(2)]
+            self.assertEqual(sorted(f.result(timeout=15) for f in futures), [200, 409])
+        self.assertEqual(AuditEvent.objects.filter(entity_type="ResourceRequest", action="close").count(), 1)
+
+    def test_simultaneous_admin_archive_preserves_history_and_audits_once(self):
+        self.offer(self.source, "1", status="REJECTED")
+        barrier = Barrier(2)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(self.action, "delete", lambda: barrier.wait(timeout=5)) for _ in range(2)]
+            self.assertEqual([f.result(timeout=15) for f in futures], [204, 204])
+        self.assertEqual(AuditEvent.objects.filter(entity_type="ResourceRequest", action="archive").count(), 1)
+        self.assertEqual(self.source.reservations.count(), 1)
+
+    def test_admin_edit_waits_for_allocation_and_preserves_floor(self):
+        started = Event()
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            with transaction.atomic():
+                ResourceRequest.objects.select_for_update().get(pk=self.source.pk)
+                future = pool.submit(self.action, "edit", started.set, "6")
+                self.assertTrue(started.wait(timeout=5))
+                self.offer(self.source, "8")
+            self.assertEqual(future.result(timeout=15), 409)
+        self.source.refresh_from_db()
+        self.assertEqual(self.source.quantity_needed, Decimal("20"))
+        self.assertEqual(AuditEvent.objects.count(), 0)

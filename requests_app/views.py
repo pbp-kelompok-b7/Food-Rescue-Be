@@ -1,5 +1,6 @@
 from decimal import Decimal
 
+from django.contrib.auth import get_user_model
 from django.db import transaction
 from django.db.models import DecimalField, Exists, F, OuterRef, Q, Subquery, Sum, Value
 from django.db.models.functions import Coalesce
@@ -11,12 +12,13 @@ from rest_framework.permissions import IsAdminUser, IsAuthenticated, IsAuthentic
 
 from common.exceptions import BusinessConflict
 from common.pagination import ContractPagination
-from common.responses import failure, success
+from common.responses import success
 from pickups.models import PickupStatus
 from reservations.models import Reservation, ReservationStatus
 from shared.models import AuditEvent
 from .models import ResourceRequest, RequestStatus
 from .serializers import (
+    AdminRequestCreateSerializer, AdminRequestQuerySerializer, AdminRequestWriteSerializer,
     RequestCloseSerializer, RequestDeleteSerializer, RequestQuerySerializer,
     RequestWriteSerializer, ResourceRequestSerializer,
 )
@@ -56,14 +58,20 @@ def public_requests(queryset):
                            quantity_remaining__gt=0, archived_at__isnull=True)
 
 
-def browse_requests(request):
-    query = RequestQuerySerializer(data=request.query_params)
+def browse_requests(request, *, moderation=False):
+    serializer_class = AdminRequestQuerySerializer if moderation else RequestQuerySerializer
+    query = serializer_class(data=request.query_params)
     query.is_valid(raise_exception=True)
     filters = query.validated_data
     if filters.get("page", 1) < 1:
         raise NotFound("Page does not exist.", code="page_not_found")
     queryset = requests_with_quantities()
-    if filters["scope"] == "mine":
+    if moderation:
+        if "owner_id" in filters:
+            queryset = queryset.filter(owner_id=filters["owner_id"])
+        if "archived" in filters:
+            queryset = queryset.filter(archived_at__isnull=filters["archived"] == "false")
+    elif filters["scope"] == "mine":
         if not request.user.is_authenticated or not request.user.is_active:
             raise NotAuthenticated("Login with an active account is required.", code="authentication_required")
         queryset = queryset.filter(owner=request.user)
@@ -117,17 +125,29 @@ def active_user(request):
     return request.user
 
 
-def create_request(request):
+def create_request(request, *, moderation=False):
     user = active_user(request)
-    serializer = RequestWriteSerializer(data=request.data)
+    serializer_class = AdminRequestCreateSerializer if moderation else RequestWriteSerializer
+    serializer = serializer_class(data=request.data)
     serializer.is_valid(raise_exception=True)
     with transaction.atomic():
-        instance = ResourceRequest.objects.create(owner=user, created_by=user, **serializer.validated_data)
+        changes = dict(serializer.validated_data)
+        reason = changes.pop("reason", "")
+        owner = user
+        if moderation:
+            owner = get_user_model().objects.select_for_update().filter(pk=changes.pop("owner_id")).first()
+            if owner is None:
+                raise NotFound("Owner not found.")
+            if not owner.is_active:
+                raise BusinessConflict("Owner account is inactive.", code="owner_inactive")
+        instance = ResourceRequest.objects.create(owner=owner, created_by=user, **changes)
         instance = requests_with_quantities().get(pk=instance.pk)
+        if moderation:
+            _audit(user, "ResourceRequest", instance.pk, "create", reason, None, _moderation_state(instance))
     return success(ResourceRequestSerializer(instance).data, message="Request created.", status=201)
 
 
-def update_request(request, pk):
+def update_request(request, pk, *, moderation=False):
     user = active_user(request)
     pk = str(pk)
     if not pk.isascii() or not pk.isdecimal() or len(pk) > 19 or not 0 < int(pk) <= 9223372036854775807:
@@ -144,11 +164,14 @@ def update_request(request, pk):
                 raise NotFound("Request not found.")
             raise PermissionDenied("Only the owner or admin may edit this request.")
 
-        serializer = RequestWriteSerializer(instance=instance, data=request.data, partial=True,
+        serializer_class = AdminRequestWriteSerializer if moderation else RequestWriteSerializer
+        serializer = serializer_class(instance=instance, data=request.data, partial=True,
                                              context={"has_reservations": instance.reservations.exists()})
         serializer.is_valid(raise_exception=True)
-        changes = serializer.validated_data
+        changes = dict(serializer.validated_data)
+        reason = changes.pop("reason", "")
         quantities = requests_with_quantities().get(pk=pk)
+        before = _moderation_state(quantities) if moderation else None
         needed = changes.get("quantity_needed", instance.quantity_needed)
         if needed < quantities.quantity_allocated + quantities.quantity_fulfilled:
             raise BusinessConflict("Quantity cannot be less than allocated plus fulfilled.", code="quantity_floor")
@@ -169,6 +192,8 @@ def update_request(request, pk):
         instance.version += 1
         instance.save(update_fields=[*changes, "status", "version", "updated_at"])
         instance = requests_with_quantities().get(pk=pk)
+        if moderation:
+            _audit(user, "ResourceRequest", instance.pk, "update", reason, before, _moderation_state(instance))
     return success(ResourceRequestSerializer(instance).data, message="Request updated.")
 
 
@@ -195,6 +220,12 @@ def _state(source):
             "archived_at": source.archived_at.isoformat() if source.archived_at else None}
 
 
+def _moderation_state(source):
+    state = dict(ResourceRequestSerializer(source).data)
+    state["created_by_id"] = source.created_by_id
+    return state
+
+
 def _audit(user, entity_type, entity_id, action, reason, before, after):
     AuditEvent.objects.create(actor=user, entity_type=entity_type, entity_id=str(entity_id),
                               action=action, summary={"reason": reason, "before": before, "after": after})
@@ -219,7 +250,7 @@ def _cancel_pending(user, reservations, reason, now):
                 "cancellation_code": reservation.cancellation_code})
 
 
-def close_request(request, pk):
+def close_request(request, pk, *, moderation=False):
     user = active_user(request)
     with transaction.atomic():
         source = _locked_request(user, pk)
@@ -233,29 +264,33 @@ def close_request(request, pk):
         quantities = requests_with_quantities().get(pk=source.pk)
         if quantities.quantity_fulfilled >= source.quantity_needed:
             raise BusinessConflict("Request has already been fully fulfilled.", code="invalid_transition")
-        before = _state(source)
+        before = _moderation_state(quantities) if moderation else _state(source)
         source.status = RequestStatus.CLOSED
         source.version += 1
         source.save(update_fields=["status", "version", "updated_at"])
         reason = body.validated_data["reason"]
         _cancel_pending(user, reservations, reason, now)
-        _audit(user, "ResourceRequest", source.pk, "close", reason, before, _state(source))
-        result = ResourceRequestSerializer(requests_with_quantities().get(pk=source.pk)).data
+        updated = requests_with_quantities().get(pk=source.pk)
+        after = _moderation_state(updated) if moderation else _state(source)
+        _audit(user, "ResourceRequest", source.pk, "close", reason, before, after)
+        result = ResourceRequestSerializer(updated).data
     return success(result, message="Request closed.")
 
 
-def delete_request(request, pk):
+def delete_request(request, pk, *, moderation=False):
     user = active_user(request)
     with transaction.atomic():
         source = _locked_request(user, pk)
-        body = RequestDeleteSerializer(data=request.data)
+        serializer_class = RequestCloseSerializer if moderation else RequestDeleteSerializer
+        body = serializer_class(data=request.data)
         body.is_valid(raise_exception=True)
         reservations = list(source.reservations.select_for_update().order_by("pk"))
-        before = _state(source)
+        before = _moderation_state(requests_with_quantities().get(pk=source.pk)) if moderation else _state(source)
+        reason = body.validated_data.get("reason", "")
         source_id = source.pk
         if not reservations:
             source.delete()
-            _audit(user, "ResourceRequest", source_id, "delete", "", before, None)
+            _audit(user, "ResourceRequest", source_id, "delete", reason, before, None)
         elif source.archived_at is None:
             now = timezone.now()
             source.archived_at = now
@@ -263,8 +298,9 @@ def delete_request(request, pk):
                 source.status = RequestStatus.EXPIRED if source.valid_until <= now else RequestStatus.CLOSED
             source.version += 1
             source.save(update_fields=["archived_at", "status", "version", "updated_at"])
-            _cancel_pending(user, reservations, "Request archived by owner or admin.", now)
-            _audit(user, "ResourceRequest", source_id, "archive", "", before, _state(source))
+            _cancel_pending(user, reservations, reason if moderation else "Request archived by owner or admin.", now)
+            after = _moderation_state(requests_with_quantities().get(pk=source.pk)) if moderation else _state(source)
+            _audit(user, "ResourceRequest", source_id, "archive", reason, before, after)
     return success(status=204)
 
 
@@ -300,36 +336,40 @@ def requests_detail_close(request, pk):
     return close_request(request, pk)
 
 
+class RequestAdminPermission(IsAdminUser):
+    def has_permission(self, request, view):
+        active_user(request)
+        return super().has_permission(request, view)
+
+
 # GET, POST /api/v1/admin/requests/
 @api_view(['GET', 'POST'])
-@permission_classes([IsAdminUser])
+@permission_classes([RequestAdminPermission])
+@parser_classes([JSONParser])
 def admin_requests(request):
+    active_user(request)
     if request.method == "GET":
-        # TODO: implement this operation.
-        return failure('Endpoint belum diimplementasikan.', [{'field': None, 'code': 'not_implemented', 'message': 'Business logic pending.'}], status=501)
-    if request.method == "POST":
-        # TODO: implement this operation.
-        return failure('Endpoint belum diimplementasikan.', [{'field': None, 'code': 'not_implemented', 'message': 'Business logic pending.'}], status=501)
+        return browse_requests(request, moderation=True)
+    return create_request(request, moderation=True)
 
 
-# GET, PATCH, DELETE /api/v1/admin/requests/<int:pk>/
+# GET, PATCH, DELETE /api/v1/admin/requests/<str:pk>/
 @api_view(['GET', 'PATCH', 'DELETE'])
-@permission_classes([IsAdminUser])
+@permission_classes([RequestAdminPermission])
+@parser_classes([JSONParser])
 def admin_requests_detail(request, pk):
+    active_user(request)
     if request.method == "GET":
-        # TODO: implement this operation.
-        return failure('Endpoint belum diimplementasikan.', [{'field': None, 'code': 'not_implemented', 'message': 'Business logic pending.'}], status=501)
+        return request_detail(request, pk)
     if request.method == "PATCH":
-        # TODO: implement this operation.
-        return failure('Endpoint belum diimplementasikan.', [{'field': None, 'code': 'not_implemented', 'message': 'Business logic pending.'}], status=501)
-    if request.method == "DELETE":
-        # TODO: implement this operation.
-        return failure('Endpoint belum diimplementasikan.', [{'field': None, 'code': 'not_implemented', 'message': 'Business logic pending.'}], status=501)
+        return update_request(request, pk, moderation=True)
+    return delete_request(request, pk, moderation=True)
 
 
-# POST /api/v1/admin/requests/<int:pk>/close/
+# POST /api/v1/admin/requests/<str:pk>/close/
 @api_view(['POST'])
-@permission_classes([IsAdminUser])
+@permission_classes([RequestAdminPermission])
+@parser_classes([JSONParser])
 def admin_requests_detail_close(request, pk):
-    # TODO: implement this operation.
-    return failure('Endpoint belum diimplementasikan.', [{'field': None, 'code': 'not_implemented', 'message': 'Business logic pending.'}], status=501)
+    active_user(request)
+    return close_request(request, pk, moderation=True)
