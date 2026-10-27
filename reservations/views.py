@@ -148,10 +148,13 @@ def reservations_detail(request, pk):
     if request.method == "PATCH":
         # Revise the pending quantity. Only the submitter may do this.
         with transaction.atomic():
+            # Lock only the reservation row. ``select_related`` on the nullable
+            # listing/request FKs would force an outer join, and PostgreSQL
+            # rejects SELECT ... FOR UPDATE against the nullable side of an
+            # outer join, so ``of=("self",)`` restricts the lock to the base
+            # table and we avoid joining the sources here.
             reservation = get_object_or_404(
-                Reservation.objects.select_for_update().select_related(
-                    "listing", "request"
-                ),
+                Reservation.objects.select_for_update(of=("self",)),
                 pk=pk,
             )
             is_participant = request.user.id in (
