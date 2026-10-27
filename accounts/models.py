@@ -8,6 +8,7 @@ from .managers import UserManager
 class User(AbstractUser):
     username = None
     email = models.EmailField(unique=True)
+    google_sub = models.CharField(max_length=255, unique=True, null=True, blank=True)
     display_name = models.CharField(max_length=100)
     whatsapp_number = models.CharField(
         max_length=16, null=True, blank=True,
