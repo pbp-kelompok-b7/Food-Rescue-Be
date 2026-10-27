@@ -1,11 +1,9 @@
 from datetime import timedelta
 import threading
 
-from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.db import IntegrityError, connection, connections, transaction
-from django.middleware.csrf import _get_new_csrf_string, _mask_cipher_secret
-from django.test import TestCase, TransactionTestCase
+from django.test import TestCase, TransactionTestCase, override_settings
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 from rest_framework.test import APIClient
@@ -14,6 +12,10 @@ from listings.models import ResourceListing
 from reservations.models import Reservation, ReservationStatus, SourceType
 from pickups.models import Pickup
 from shared.enums import ResourceType, Mode, Unit
+
+FAST_HASHER = override_settings(
+    PASSWORD_HASHERS=["django.contrib.auth.hashers.MD5PasswordHasher"]
+)
 
 User = get_user_model()
 PROVIDER_WA = "+6281211110001"
@@ -120,6 +122,7 @@ def make_pickup(reservation, scheduled_at=None, status="SCHEDULED"):
 
 
 # ---------------------------------------------------------------- pickup creation tests
+@FAST_HASHER
 class PickupCreateBase(TestCase):
     def setUp(self):
         self.provider = make_user("provider")
@@ -167,6 +170,12 @@ class PickupCreateBase(TestCase):
 
     def assertNoPickup(self):
         self.assertEqual(Pickup.objects.count(), 0, "failed request must not create a pickup")
+        
+    def csrf_token_for(self, client):
+            """Start the CSRF flow like the frontend does (contract 7.1.1)."""
+            resp = client.get("/api/v1/auth/csrf/")
+            assert resp.status_code == 200, resp.content
+            return resp.json()["data"]["csrf_token"]
 
 
 class PickupCreateSuccessTests(PickupCreateBase):
@@ -266,12 +275,9 @@ class PickupCreateAccessTests(PickupCreateBase):
     def test_valid_csrf_token_accepted(self):
         client = APIClient(enforce_csrf_checks=True)
         client.force_login(self.provider)
-        # GET /auth/csrf/ is not implemented yet (separate issue), so the cookie + header are built manually.
-        secret = _get_new_csrf_string()
-        client.cookies[settings.CSRF_COOKIE_NAME] = secret
+        token = self.csrf_token_for(client)
         resp = client.post(
-            self.url(), self.payload(), format="json",
-            HTTP_X_CSRFTOKEN=_mask_cipher_secret(secret),
+            self.url(), self.payload(), format="json", HTTP_X_CSRFTOKEN=token,
         )
         self.assertEqual(resp.status_code, 201, resp.content)
 
@@ -809,11 +815,10 @@ class PickupPatchAccessTests(PickupReadUpdateBase):
  
     def test_valid_csrf_token_accepted(self):
         client = self.client_for(self.provider, enforce_csrf_checks=True)
-        secret = _get_new_csrf_string()
-        client.cookies[settings.CSRF_COOKIE_NAME] = secret
+        token = self.csrf_token_for(client)
         resp = client.patch(
             self.detail_url(), {"instructions": "Dengan CSRF"}, format="json",
-            HTTP_X_CSRFTOKEN=_mask_cipher_secret(secret),
+            HTTP_X_CSRFTOKEN=token,
         )
         self.assertEqual(resp.status_code, 200, resp.content)
  
@@ -1026,6 +1031,7 @@ class PickupPatchConflictTests(PickupReadUpdateBase):
 # ---------------------------------------------------------------- concurrency (PostgreSQL)
 
 # ---------------------------------------------------------------- concurrent pickup creation
+@FAST_HASHER
 class PickupCreateConcurrencyTests(TransactionTestCase):
     # Tests concurrent API requests, each running on its own separate DB connection.
 
@@ -1102,7 +1108,8 @@ class PickupCreateConcurrencyTests(TransactionTestCase):
         
 
 # ---------------------------------------------------------------- 
-# concurrent instruction update (PostgreSQL)        
+# concurrent instruction update (PostgreSQL)
+@FAST_HASHER       
 class PickupPatchConcurrencyTests(TransactionTestCase):
     # Concurrent PATCH requests, each on its own separate DB connection.
  
