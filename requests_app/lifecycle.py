@@ -16,7 +16,7 @@ from common.responses import success
 from reservations.models import ReservationStatus
 from shared.models import AuditEvent
 from .models import ResourceRequest, RequestStatus
-from .queries import public_requests, requests_with_quantities
+from .views import public_requests, requests_with_quantities
 from .serializers import RequestCloseSerializer, RequestDeleteSerializer, ResourceRequestSerializer
 from .writes import active_user
 

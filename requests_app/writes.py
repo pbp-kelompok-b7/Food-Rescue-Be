@@ -8,7 +8,7 @@ from rest_framework.exceptions import NotAuthenticated, NotFound, PermissionDeni
 from common.exceptions import BusinessConflict
 from common.responses import success
 from .models import ResourceRequest, RequestStatus
-from .queries import public_requests, requests_with_quantities
+from .views import public_requests, requests_with_quantities
 from .serializers import RequestWriteSerializer, ResourceRequestSerializer
 
 
