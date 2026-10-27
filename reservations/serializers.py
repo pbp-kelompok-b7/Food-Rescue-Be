@@ -101,14 +101,41 @@ class ReservationSerializer(serializers.Serializer):
         return obj.cancellation_code or None
 
     def get_pickup(self, obj):
-        # Pickup scheduling (section 7.5) is out of scope for this endpoint; a
-        # freshly created PENDING claim never has a pickup.
-        return None
+        # A reservation has at most one pickup (section 7.5). Render it when it
+        # exists; otherwise null (e.g. a PENDING reservation never has one).
+        pickup = getattr(obj, "pickup", None)
+        if pickup is None:
+            return None
+        return PickupRefSerializer(pickup).data
 
     def get_counterparty_contact(self, obj):
-        # Contact is only exposed to the transaction partner once ACCEPTED
-        # (section 7.4.4). A PENDING claim exposes no contact.
-        return None
+        """Contact of the transaction partner, relative to the viewer.
+
+        Only revealed to a participant once the reservation is ACCEPTED and the
+        other party's WhatsApp number is filled (sections 7.4.4 / 10). The
+        viewing user is passed through serializer context. A non-participant
+        admin receives null here: this single field cannot carry both parties'
+        contacts, so admin moderation uses the admin detail endpoint instead.
+        """
+        viewer = self.context.get("viewer")
+        if viewer is None or obj.status != ReservationStatus.ACCEPTED:
+            return None
+
+        if viewer.id == obj.provider_id:
+            other = obj.receiver
+        elif viewer.id == obj.receiver_id:
+            other = obj.provider
+        else:
+            # Non-participant (e.g. admin): no single "counterparty".
+            return None
+
+        if not other.whatsapp_number:
+            return None
+        return {
+            "user_id": other.id,
+            "whatsapp_number": other.whatsapp_number,
+            "whatsapp_url": None,
+        }
 
 
 class ListingClaimCreateSerializer(serializers.Serializer):
@@ -357,3 +384,84 @@ class RequestOfferCreateSerializer(serializers.Serializer):
             resource_deadline=validated_data["resource_deadline"],
             status=ReservationStatus.PENDING,
         )
+
+
+class ReservationReviseSerializer(serializers.Serializer):
+    """Revise the quantity of a PENDING reservation (section 7.4.5).
+
+    Only the submitter may revise, and only ``quantity`` is mutable. Price,
+    mode, unit, source, and the transaction parties are immutable. The caller
+    must send ``expected_version`` (optimistic concurrency); a mismatch yields
+    409 ``stale_version``. Each successful revision bumps ``version``. A PENDING
+    reservation holds no allocation, so availability is only re-checked, never
+    reallocated.
+    """
+
+    quantity = serializers.DecimalField(max_digits=15, decimal_places=3, required=False)
+    expected_version = serializers.IntegerField()
+
+    def __init__(self, *args, reservation=None, user=None, **kwargs):
+        self.reservation = reservation
+        self.user = user
+        super().__init__(*args, **kwargs)
+
+    def validate_quantity(self, value):
+        if value <= 0:
+            raise serializers.ValidationError("Quantity must be greater than zero.")
+        unit = self.reservation.unit
+        if unit in INTEGER_UNITS and value != value.to_integral_value(rounding=ROUND_FLOOR):
+            raise serializers.ValidationError(
+                f"Quantity for unit '{unit}' must be a whole number."
+            )
+        return value
+
+    def validate(self, attrs):
+        reservation = self.reservation
+
+        # Only PENDING submissions can be revised.
+        if reservation.status != ReservationStatus.PENDING:
+            raise BusinessConflict(
+                "Only a pending reservation can be revised.", code="invalid_transition"
+            )
+
+        # Optimistic concurrency: the client must have seen the latest version.
+        if attrs["expected_version"] != reservation.version:
+            raise BusinessConflict(
+                f"Reservation has changed; current version is {reservation.version}.",
+                code="stale_version",
+            )
+
+        if "quantity" not in attrs:
+            raise serializers.ValidationError(
+                {"quantity": "At least one revisable field is required."}
+            )
+
+        # Re-check availability/remaining against the source. PENDING holds no
+        # allocation, so only ACCEPTED reservations count.
+        new_quantity = attrs["quantity"]
+        if reservation.source_type == SourceType.LISTING_CLAIM:
+            source = reservation.listing
+            total = source.quantity_total
+            label = "available"
+        else:
+            source = reservation.request
+            total = source.quantity_needed
+            label = "remaining"
+        allocated = source.reservations.filter(
+            status__in=ACTIVE_ALLOCATION_STATUSES
+        ).aggregate(total=Sum("quantity"))["total"] or Decimal("0")
+        headroom = total - allocated
+        if new_quantity > headroom:
+            raise BusinessConflict(
+                f"Revised quantity exceeds the {label} quantity ({headroom}).",
+                code="insufficient_quantity",
+            )
+
+        return attrs
+
+    def save(self):
+        reservation = self.reservation
+        reservation.quantity = self.validated_data["quantity"]
+        reservation.version = reservation.version + 1
+        reservation.save(update_fields=["quantity", "version", "updated_at"])
+        return reservation

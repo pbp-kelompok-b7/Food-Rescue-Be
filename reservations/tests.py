@@ -533,3 +533,277 @@ class RequestOfferTests(TestCase):
         self.auth(self.provider)
         self.client.post(self.url(self.request.pk), offer_payload(), format="json")
         self.assertEqual(ResourceListing.objects.count(), 0)
+
+
+def make_admin(email):
+    u = User.objects.create_user(email=email, password="pass12345", display_name="Admin")
+    u.is_staff = True
+    u.save(update_fields=["is_staff"])
+    return u
+
+
+def make_claim_reservation(listing, receiver, **overrides):
+    """Create a LISTING_CLAIM reservation directly (submitter = receiver)."""
+    defaults = dict(
+        source_type=SourceType.LISTING_CLAIM,
+        listing=listing,
+        provider=listing.owner,
+        receiver=receiver,
+        submitted_by=receiver,
+        quantity=Decimal("5"),
+        unit=listing.unit,
+        mode=listing.mode,
+        unit_price=listing.unit_price,
+        resource_deadline=listing.available_until,
+        status=ReservationStatus.PENDING,
+    )
+    defaults.update(overrides)
+    return Reservation.objects.create(**defaults)
+
+
+class ReservationInboxTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.provider = make_user("inbox_provider@example.com")
+        self.receiver = make_user("inbox_receiver@example.com")
+        self.outsider = make_user("inbox_outsider@example.com")
+        self.listing = make_listing(self.provider)
+        self.res = make_claim_reservation(self.listing, self.receiver)
+
+    def auth(self, user):
+        self.client.force_authenticate(user)
+
+    # --- list scoping -----------------------------------------------------
+    def test_list_shows_only_own_reservations(self):
+        self.auth(self.receiver)
+        res = self.client.get("/api/v1/reservations/")
+        self.assertEqual(res.status_code, 200, res.data)
+        results = res.data["data"]["results"]
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["id"], self.res.pk)
+
+    def test_outsider_sees_empty_list(self):
+        self.auth(self.outsider)
+        res = self.client.get("/api/v1/reservations/")
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.data["data"]["count"], 0)
+
+    def test_list_requires_auth(self):
+        self.assertEqual(self.client.get("/api/v1/reservations/").status_code, 401)
+
+    def test_role_filter(self):
+        self.auth(self.receiver)
+        both = self.client.get("/api/v1/reservations/?role=receiver")
+        self.assertEqual(both.data["data"]["count"], 1)
+        none = self.client.get("/api/v1/reservations/?role=provider")
+        self.assertEqual(none.data["data"]["count"], 0)
+
+    def test_status_and_source_filters(self):
+        self.auth(self.receiver)
+        self.assertEqual(
+            self.client.get("/api/v1/reservations/?status=PENDING").data["data"]["count"], 1
+        )
+        self.assertEqual(
+            self.client.get("/api/v1/reservations/?status=ACCEPTED").data["data"]["count"], 0
+        )
+        self.assertEqual(
+            self.client.get("/api/v1/reservations/?source_type=LISTING_CLAIM").data["data"]["count"], 1
+        )
+
+    def test_invalid_filter_rejected(self):
+        self.auth(self.receiver)
+        self.assertEqual(self.client.get("/api/v1/reservations/?role=bogus").status_code, 400)
+        self.assertEqual(self.client.get("/api/v1/reservations/?status=BOGUS").status_code, 400)
+        self.assertEqual(self.client.get("/api/v1/reservations/?source_type=BOGUS").status_code, 400)
+
+    def test_ordering_newest_first(self):
+        second = make_claim_reservation(self.listing, self.receiver)
+        self.auth(self.receiver)
+        results = self.client.get("/api/v1/reservations/").data["data"]["results"]
+        self.assertEqual([r["id"] for r in results], [second.pk, self.res.pk])
+
+
+class ReservationDetailTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.provider = make_user("det_provider@example.com", whatsapp_number="+628111111111")
+        self.receiver = make_user("det_receiver@example.com", whatsapp_number="+628222222222")
+        self.outsider = make_user("det_outsider@example.com")
+        self.admin = make_admin("det_admin@example.com")
+        self.listing = make_listing(self.provider)
+        self.res = make_claim_reservation(self.listing, self.receiver)
+
+    def auth(self, user):
+        self.client.force_authenticate(user)
+
+    def url(self, pk):
+        return f"/api/v1/reservations/{pk}/"
+
+    def test_participant_can_read(self):
+        self.auth(self.receiver)
+        res = self.client.get(self.url(self.res.pk))
+        self.assertEqual(res.status_code, 200, res.data)
+        self.assertEqual(res.data["data"]["id"], self.res.pk)
+
+    def test_outsider_gets_404(self):
+        self.auth(self.outsider)
+        self.assertEqual(self.client.get(self.url(self.res.pk)).status_code, 404)
+
+    def test_admin_non_participant_can_read(self):
+        self.auth(self.admin)
+        self.assertEqual(self.client.get(self.url(self.res.pk)).status_code, 200)
+
+    def test_missing_reservation_404(self):
+        self.auth(self.receiver)
+        self.assertEqual(self.client.get(self.url(999999)).status_code, 404)
+
+    def test_history_readable_in_terminal_status(self):
+        self.res.status = ReservationStatus.REJECTED
+        self.res.save(update_fields=["status"])
+        self.auth(self.receiver)
+        res = self.client.get(self.url(self.res.pk))
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.data["data"]["status"], ReservationStatus.REJECTED)
+
+    # --- contact privacy --------------------------------------------------
+    def test_no_contact_while_pending(self):
+        self.auth(self.receiver)
+        res = self.client.get(self.url(self.res.pk))
+        self.assertIsNone(res.data["data"]["counterparty_contact"])
+
+    def test_contact_revealed_to_participant_when_accepted(self):
+        self.res.status = ReservationStatus.ACCEPTED
+        self.res.save(update_fields=["status"])
+        self.auth(self.receiver)
+        res = self.client.get(self.url(self.res.pk))
+        contact = res.data["data"]["counterparty_contact"]
+        # Receiver sees the provider's contact.
+        self.assertIsNotNone(contact)
+        self.assertEqual(contact["user_id"], self.provider.id)
+        self.assertEqual(contact["whatsapp_number"], "+628111111111")
+
+    def test_contact_null_when_other_number_missing(self):
+        self.provider.whatsapp_number = None
+        self.provider.save(update_fields=["whatsapp_number"])
+        self.res.status = ReservationStatus.ACCEPTED
+        self.res.save(update_fields=["status"])
+        self.auth(self.receiver)
+        res = self.client.get(self.url(self.res.pk))
+        self.assertIsNone(res.data["data"]["counterparty_contact"])
+
+    def test_non_participant_admin_gets_null_contact(self):
+        self.res.status = ReservationStatus.ACCEPTED
+        self.res.save(update_fields=["status"])
+        self.auth(self.admin)
+        res = self.client.get(self.url(self.res.pk))
+        self.assertIsNone(res.data["data"]["counterparty_contact"])
+
+    def test_pickup_null_without_pickup(self):
+        self.auth(self.receiver)
+        res = self.client.get(self.url(self.res.pk))
+        self.assertIsNone(res.data["data"]["pickup"])
+
+
+class ReservationReviseTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.provider = make_user("rev_provider@example.com")
+        self.receiver = make_user("rev_receiver@example.com")
+        self.outsider = make_user("rev_outsider@example.com")
+        self.listing = make_listing(self.provider, quantity_total=Decimal("20"))
+        self.res = make_claim_reservation(self.listing, self.receiver, quantity=Decimal("5"))
+
+    def auth(self, user):
+        self.client.force_authenticate(user)
+
+    def url(self, pk):
+        return f"/api/v1/reservations/{pk}/"
+
+    def patch(self, pk, body):
+        return self.client.patch(self.url(pk), body, format="json")
+
+    # --- success ----------------------------------------------------------
+    def test_submitter_revises_quantity_and_version_bumps(self):
+        self.auth(self.receiver)
+        res = self.patch(self.res.pk, {"quantity": "8", "expected_version": 1})
+        self.assertEqual(res.status_code, 200, res.data)
+        self.assertEqual(Decimal(res.data["data"]["terms"]["quantity"]), Decimal("8"))
+        self.assertEqual(res.data["data"]["version"], 2)
+        self.res.refresh_from_db()
+        self.assertEqual(self.res.quantity, Decimal("8"))
+        self.assertEqual(self.res.version, 2)
+
+    # --- permission -------------------------------------------------------
+    def test_non_submitter_participant_forbidden(self):
+        # Provider is the approver here, not the submitter.
+        self.auth(self.provider)
+        res = self.patch(self.res.pk, {"quantity": "8", "expected_version": 1})
+        self.assertEqual(res.status_code, 403, res.data)
+
+    def test_outsider_gets_404(self):
+        self.auth(self.outsider)
+        res = self.patch(self.res.pk, {"quantity": "8", "expected_version": 1})
+        self.assertEqual(res.status_code, 404)
+
+    def test_revise_requires_auth(self):
+        res = self.patch(self.res.pk, {"quantity": "8", "expected_version": 1})
+        self.assertEqual(res.status_code, 401)
+
+    # --- expected_version / stale ----------------------------------------
+    def test_expected_version_required(self):
+        self.auth(self.receiver)
+        res = self.patch(self.res.pk, {"quantity": "8"})
+        self.assertEqual(res.status_code, 400, res.data)
+
+    def test_stale_version_rejected(self):
+        self.auth(self.receiver)
+        res = self.patch(self.res.pk, {"quantity": "8", "expected_version": 99})
+        self.assertEqual(res.status_code, 409, res.data)
+        self.assertIn("stale_version", error_codes(res))
+
+    # --- invalid transition ----------------------------------------------
+    def test_cannot_revise_non_pending(self):
+        self.res.status = ReservationStatus.ACCEPTED
+        self.res.save(update_fields=["status"])
+        self.auth(self.receiver)
+        res = self.patch(self.res.pk, {"quantity": "8", "expected_version": 1})
+        self.assertEqual(res.status_code, 409, res.data)
+        self.assertIn("invalid_transition", error_codes(res))
+
+    # --- immutability -----------------------------------------------------
+    def test_price_and_parties_not_revisable(self):
+        self.auth(self.receiver)
+        res = self.patch(
+            self.res.pk,
+            {
+                "quantity": "6",
+                "expected_version": 1,
+                "unit_price": "9999",
+                "mode": "SELL",
+                "provider": self.receiver.id,
+            },
+        )
+        self.assertEqual(res.status_code, 200, res.data)
+        data = res.data["data"]
+        self.assertEqual(Decimal(data["terms"]["unit_price"]), self.listing.unit_price)
+        self.assertEqual(data["terms"]["mode"], self.listing.mode)
+        self.assertEqual(data["provider"]["id"], self.provider.id)
+
+    # --- precision / availability -----------------------------------------
+    def test_fractional_rejected_for_integer_unit(self):
+        self.auth(self.receiver)
+        res = self.patch(self.res.pk, {"quantity": "2.5", "expected_version": 1})
+        self.assertEqual(res.status_code, 400, res.data)
+
+    def test_revised_quantity_exceeding_available_rejected(self):
+        self.auth(self.receiver)
+        res = self.patch(self.res.pk, {"quantity": "21", "expected_version": 1})
+        self.assertEqual(res.status_code, 409, res.data)
+        self.assertIn("insufficient_quantity", error_codes(res))
+
+    def test_revise_pending_does_not_allocate(self):
+        self.auth(self.receiver)
+        self.patch(self.res.pk, {"quantity": "8", "expected_version": 1})
+        self.listing.refresh_from_db()
+        self.assertEqual(self.listing.quantity_total, Decimal("20"))
+        self.assertEqual(self.listing.status, ListingStatus.AVAILABLE)
