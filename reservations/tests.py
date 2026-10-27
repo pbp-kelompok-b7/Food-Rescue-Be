@@ -807,3 +807,211 @@ class ReservationReviseTests(TestCase):
         self.listing.refresh_from_db()
         self.assertEqual(self.listing.quantity_total, Decimal("20"))
         self.assertEqual(self.listing.status, ListingStatus.AVAILABLE)
+
+
+class ReservationAcceptTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.provider = make_user("acc_provider@example.com")
+        self.receiver = make_user("acc_receiver@example.com")
+        self.outsider = make_user("acc_outsider@example.com")
+        self.listing = make_listing(self.provider, quantity_total=Decimal("20"))
+        self.res = make_claim_reservation(self.listing, self.receiver, quantity=Decimal("5"))
+
+    def auth(self, user):
+        self.client.force_authenticate(user)
+
+    def url(self, pk):
+        return f"/api/v1/reservations/{pk}/accept/"
+
+    def accept(self, pk, version=1):
+        return self.client.post(self.url(pk), {"expected_version": version}, format="json")
+
+    # --- success ----------------------------------------------------------
+    def test_provider_accepts_claim(self):
+        self.auth(self.provider)
+        res = self.accept(self.res.pk, 1)
+        self.assertEqual(res.status_code, 200, res.data)
+        data = res.data["data"]
+        self.assertEqual(data["status"], ReservationStatus.ACCEPTED)
+        self.assertIsNotNone(data["accepted_at"])
+        self.assertIsNotNone(data["accepted_snapshot"])
+        self.assertEqual(data["version"], 2)
+        self.res.refresh_from_db()
+        self.assertEqual(self.res.status, ReservationStatus.ACCEPTED)
+
+    def test_accept_partial_keeps_listing_available(self):
+        self.auth(self.provider)
+        self.accept(self.res.pk, 1)
+        self.listing.refresh_from_db()
+        # 5 of 20 allocated -> still AVAILABLE.
+        self.assertEqual(self.listing.status, ListingStatus.AVAILABLE)
+
+    def test_accept_full_quantity_reserves_listing(self):
+        full = make_claim_reservation(self.listing, self.receiver, quantity=Decimal("20"))
+        self.auth(self.provider)
+        res = self.accept(full.pk, 1)
+        self.assertEqual(res.status_code, 200, res.data)
+        self.listing.refresh_from_db()
+        self.assertEqual(self.listing.status, ListingStatus.RESERVED)
+
+    def test_snapshot_immutable_against_source_edit(self):
+        self.auth(self.provider)
+        self.accept(self.res.pk, 1)
+        self.res.refresh_from_db()
+        snap_before = self.res.accepted_snapshot
+        # Edit the listing after acceptance (switch to SELL with a new price;
+        # DONATE requires a zero price, so change mode and price together).
+        self.listing.title = "Changed title"
+        self.listing.mode = Mode.SELL
+        self.listing.unit_price = Decimal("777.00")
+        self.listing.save(update_fields=["title", "mode", "unit_price"])
+        self.auth(self.provider)
+        res = self.client.get(f"/api/v1/reservations/{self.res.pk}/")
+        self.assertEqual(res.data["data"]["accepted_snapshot"], snap_before)
+        self.assertEqual(res.data["data"]["accepted_snapshot"]["title"], "Surplus Ricebox")
+
+    # --- offer acceptance by receiver ------------------------------------
+    def test_receiver_accepts_offer(self):
+        req = make_request(self.receiver, quantity_needed=Decimal("10"))
+        offer = Reservation.objects.create(
+            source_type=SourceType.REQUEST_OFFER,
+            request=req,
+            provider=self.provider,
+            receiver=self.receiver,
+            submitted_by=self.provider,
+            quantity=Decimal("10"),
+            unit=req.unit,
+            mode=Mode.DONATE,
+            unit_price=Decimal("0"),
+            resource_data={
+                "resource_type": req.resource_type,
+                "title": "Offer box",
+                "category": req.category,
+                "description": "d",
+                "condition": "c",
+                "suitability": ["HUMAN_CONSUMPTION"],
+                "location": {"label": "x", "area": "Depok"},
+                "storage_notes": None,
+                "allergen_notes": None,
+                "packaging_status": None,
+            },
+            resource_deadline=timezone.now() + timedelta(days=1),
+            status=ReservationStatus.PENDING,
+        )
+        self.auth(self.receiver)
+        res = self.accept(offer.pk, 1)
+        self.assertEqual(res.status_code, 200, res.data)
+        req.refresh_from_db()
+        self.assertEqual(req.status, RequestStatus.ALLOCATED)
+
+    # --- permission / wrong approver -------------------------------------
+    def test_claim_receiver_cannot_accept(self):
+        # Receiver is the submitter of a claim, not the approver.
+        self.auth(self.receiver)
+        res = self.accept(self.res.pk, 1)
+        self.assertEqual(res.status_code, 409, res.data)
+        self.assertIn("invalid_transition", error_codes(res))
+
+    def test_outsider_gets_404(self):
+        self.auth(self.outsider)
+        self.assertEqual(self.accept(self.res.pk, 1).status_code, 404)
+
+    def test_accept_requires_auth(self):
+        self.assertEqual(self.accept(self.res.pk, 1).status_code, 401)
+
+    # --- expected_version -------------------------------------------------
+    def test_expected_version_required(self):
+        self.auth(self.provider)
+        res = self.client.post(self.url(self.res.pk), {}, format="json")
+        self.assertEqual(res.status_code, 400, res.data)
+
+    def test_stale_version_rejected(self):
+        self.auth(self.provider)
+        res = self.accept(self.res.pk, 99)
+        self.assertEqual(res.status_code, 409, res.data)
+        self.assertIn("stale_version", error_codes(res))
+
+    # --- invalid transition ----------------------------------------------
+    def test_cannot_accept_non_pending(self):
+        self.res.status = ReservationStatus.REJECTED
+        self.res.save(update_fields=["status"])
+        self.auth(self.provider)
+        res = self.accept(self.res.pk, 1)
+        self.assertEqual(res.status_code, 409, res.data)
+        self.assertIn("invalid_transition", error_codes(res))
+
+    # --- overselling guard (sequential proxy for concurrency) ------------
+    def test_second_acceptance_exceeding_remaining_fails(self):
+        a = make_claim_reservation(self.listing, self.receiver, quantity=Decimal("15"))
+        b = make_claim_reservation(self.listing, make_user("acc_r2@example.com"), quantity=Decimal("15"))
+        self.auth(self.provider)
+        self.assertEqual(self.accept(a.pk, 1).status_code, 200)
+        # 15 of 20 allocated; a second 15 would oversell.
+        over = self.accept(b.pk, 1)
+        self.assertEqual(over.status_code, 409, over.data)
+        self.assertIn("insufficient_quantity", error_codes(over))
+
+    def test_accept_rolls_back_on_failure(self):
+        # Force failure via stale version; ensure nothing changed.
+        self.auth(self.provider)
+        self.accept(self.res.pk, 99)
+        self.res.refresh_from_db()
+        self.listing.refresh_from_db()
+        self.assertEqual(self.res.status, ReservationStatus.PENDING)
+        self.assertIsNone(self.res.accepted_at)
+        self.assertEqual(self.listing.status, ListingStatus.AVAILABLE)
+
+    # --- source status / deadline ----------------------------------------
+    def test_accept_on_closed_listing_fails(self):
+        self.listing.status = ListingStatus.CLOSED
+        self.listing.save(update_fields=["status"])
+        self.auth(self.provider)
+        res = self.accept(self.res.pk, 1)
+        self.assertEqual(res.status_code, 409, res.data)
+        self.assertIn("source_not_accepting", error_codes(res))
+
+    def test_accept_past_deadline_fails(self):
+        self.listing.available_until = timezone.now() - timedelta(hours=1)
+        self.listing.save(update_fields=["available_until"])
+        self.auth(self.provider)
+        res = self.accept(self.res.pk, 1)
+        self.assertEqual(res.status_code, 409, res.data)
+        self.assertIn("deadline_passed", error_codes(res))
+
+    # --- offer terms re-check --------------------------------------------
+    def test_offer_terms_rechecked_against_edited_request(self):
+        req = make_request(self.receiver, quantity_needed=Decimal("10"), max_unit_price=Decimal("5000.00"))
+        offer = Reservation.objects.create(
+            source_type=SourceType.REQUEST_OFFER,
+            request=req,
+            provider=self.provider,
+            receiver=self.receiver,
+            submitted_by=self.provider,
+            quantity=Decimal("5"),
+            unit=req.unit,
+            mode=Mode.SELL,
+            unit_price=Decimal("5000.00"),
+            resource_data={
+                "resource_type": req.resource_type,
+                "title": "Offer box",
+                "category": req.category,
+                "description": "d",
+                "condition": "c",
+                "suitability": ["HUMAN_CONSUMPTION"],
+                "location": {"label": "x", "area": "Depok"},
+                "storage_notes": None,
+                "allergen_notes": None,
+                "packaging_status": None,
+            },
+            resource_deadline=timezone.now() + timedelta(days=1),
+            status=ReservationStatus.PENDING,
+        )
+        # Request later tightened to donate_only -> SELL offer no longer valid.
+        req.donate_only = True
+        req.max_unit_price = None
+        req.save(update_fields=["donate_only", "max_unit_price"])
+        self.auth(self.receiver)
+        res = self.accept(offer.pk, 1)
+        self.assertEqual(res.status_code, 409, res.data)
+        self.assertIn("terms_mismatch", error_codes(res))

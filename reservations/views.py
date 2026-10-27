@@ -12,6 +12,7 @@ from requests_app.models import ResourceRequest
 from .models import Reservation, ReservationStatus, SourceType
 from .serializers import (
     ListingClaimCreateSerializer,
+    ReservationAcceptSerializer,
     RequestOfferCreateSerializer,
     ReservationReviseSerializer,
     ReservationSerializer,
@@ -175,12 +176,58 @@ def reservations_detail(request, pk):
         return success(data, message="Perubahan berhasil disimpan")
 
 
+def _lock_source_then_reservation(pk):
+    """Lock the source row, then the reservation row (section 5.3 order).
+
+    Returns ``(reservation, source)`` where source is the locked
+    ResourceListing or ResourceRequest. Both locks use ``FOR UPDATE`` on a
+    single base table (no joins) so PostgreSQL accepts them. Raises Http404 if
+    the reservation does not exist.
+    """
+    # Read the reservation unlocked first to learn which source to lock.
+    stub = get_object_or_404(
+        Reservation.objects.only("id", "source_type", "listing_id", "request_id"), pk=pk
+    )
+    if stub.source_type == SourceType.LISTING_CLAIM:
+        source = (
+            ResourceListing.objects.select_for_update().get(pk=stub.listing_id)
+        )
+    else:
+        source = (
+            ResourceRequest.objects.select_for_update().get(pk=stub.request_id)
+        )
+    reservation = (
+        Reservation.objects.select_for_update(of=("self",)).get(pk=pk)
+    )
+    return reservation, source
+
+
 # POST /api/v1/reservations/<int:pk>/accept/
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def reservations_detail_accept(request, pk):
-    # TODO: implement this operation.
-    return failure('Endpoint belum diimplementasikan.', [{'field': None, 'code': 'not_implemented', 'message': 'Business logic pending.'}], status=501)
+    """Accept a PENDING reservation atomically (section 7.4.6).
+
+    Claim is accepted by the provider, offer by the receiver. The source row is
+    locked first, then the reservation, so the availability re-check and the
+    allocation commit together or roll back together.
+    """
+    with transaction.atomic():
+        reservation, source = _lock_source_then_reservation(pk)
+        if request.user.id not in (reservation.provider_id, reservation.receiver_id):
+            # Hide existence from non-participants (privacy 404).
+            raise Http404
+        serializer = ReservationAcceptSerializer(
+            data=request.data,
+            reservation=reservation,
+            user=request.user,
+            source_obj=source,
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+    reservation.refresh_from_db()
+    data = ReservationSerializer(reservation, context={"viewer": request.user}).data
+    return success(data, message="Pengajuan diterima")
 
 
 # POST /api/v1/reservations/<int:pk>/reject/

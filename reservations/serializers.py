@@ -1,8 +1,11 @@
 from decimal import Decimal, ROUND_FLOOR
 
+import json
+
 from django.db.models import Sum
 from django.utils import timezone
 from rest_framework import serializers
+from rest_framework.renderers import JSONRenderer
 
 from common.exceptions import BusinessConflict
 from listings.models import ListingStatus
@@ -464,4 +467,186 @@ class ReservationReviseSerializer(serializers.Serializer):
         reservation.quantity = self.validated_data["quantity"]
         reservation.version = reservation.version + 1
         reservation.save(update_fields=["quantity", "version", "updated_at"])
+        return reservation
+
+
+def _offer_terms_mismatches(reservation, req):
+    """Re-validate an offer's stored terms against the (possibly edited)
+    request at acceptance time (section 5.3 step 3). Returns a list of
+    mismatching field names (empty when the offer is still compatible).
+    """
+    data = reservation.resource_data or {}
+    suitability = data.get("suitability") or []
+    mismatches = []
+    if data.get("resource_type") != req.resource_type:
+        mismatches.append("resource_type")
+    if data.get("category") != req.category:
+        mismatches.append("category")
+    if reservation.unit != req.unit:
+        mismatches.append("unit")
+    if req.intended_use not in suitability:
+        mismatches.append("suitability")
+    if data.get("resource_type") == ResourceType.PACKAGED_FOOD_SURPLUS:
+        if suitability != [Suitability.HUMAN_CONSUMPTION]:
+            mismatches.append("suitability")
+    elif data.get("resource_type") == ResourceType.COMPOSTABLE_FOOD_WASTE:
+        if Suitability.HUMAN_CONSUMPTION in suitability:
+            mismatches.append("suitability")
+    if reservation.mode == Mode.DONATE and reservation.unit_price != 0:
+        mismatches.append("unit_price")
+    if reservation.mode == Mode.SELL and reservation.unit_price <= 0:
+        mismatches.append("unit_price")
+    if req.donate_only and reservation.mode == Mode.SELL:
+        mismatches.append("mode")
+    if (
+        reservation.mode == Mode.SELL
+        and req.max_unit_price is not None
+        and reservation.unit_price > req.max_unit_price
+    ):
+        mismatches.append("unit_price")
+    return sorted(set(mismatches))
+
+
+class ReservationAcceptSerializer(serializers.Serializer):
+    """Accept a PENDING reservation, atomically (section 7.4.6 / 5.1-5.3).
+
+    Claim approver = provider; offer approver = receiver. The caller must send
+    ``expected_version`` (optimistic concurrency); a mismatch yields 409
+    ``stale_version``. On success the reservation becomes ACCEPTED with an
+    ``accepted_at`` timestamp and an immutable ``accepted_snapshot``, the
+    quantity is allocated (counted because the reservation is now ACCEPTED), and
+    the source status is recomputed — all in the caller's transaction.
+
+    The source row must already be locked by the view (lock order: source then
+    reservation) so the availability re-check and the allocation commit together.
+    """
+
+    expected_version = serializers.IntegerField()
+
+    def __init__(self, *args, reservation=None, user=None, source_obj=None, **kwargs):
+        # NOTE: ``source`` is reserved by DRF's Field/Serializer machinery, so
+        # the locked source row is stored as ``source_obj``.
+        self.reservation = reservation
+        self.user = user
+        self.source_obj = source_obj  # the locked ResourceListing or ResourceRequest
+        super().__init__(*args, **kwargs)
+
+    def validate(self, attrs):
+        reservation = self.reservation
+        user = self.user
+        source = self.source_obj
+
+        # Only PENDING reservations can be accepted.
+        if reservation.status != ReservationStatus.PENDING:
+            raise BusinessConflict(
+                "Only a pending reservation can be accepted.",
+                code="invalid_transition",
+            )
+
+        # Authorization: claim is approved by the provider, offer by the
+        # receiver. (Non-participants never reach here; the view hides them.)
+        if reservation.source_type == SourceType.LISTING_CLAIM:
+            approver_id = reservation.provider_id
+        else:
+            approver_id = reservation.receiver_id
+        if user.id != approver_id:
+            raise BusinessConflict(
+                "You are not allowed to accept this reservation.",
+                code="invalid_transition",
+            )
+
+        # Optimistic concurrency: the approver must have seen the latest version.
+        if attrs["expected_version"] != reservation.version:
+            raise BusinessConflict(
+                f"Reservation has changed; current version is {reservation.version}.",
+                code="stale_version",
+            )
+
+        now = timezone.now()
+        if reservation.source_type == SourceType.LISTING_CLAIM:
+            # Source must still be AVAILABLE and before its deadline.
+            if source.status != ListingStatus.AVAILABLE:
+                raise BusinessConflict(
+                    "The listing is no longer accepting claims.",
+                    code="source_not_accepting",
+                )
+            if source.available_until <= now:
+                raise BusinessConflict(
+                    "The listing deadline has passed.", code="deadline_passed"
+                )
+            total = source.quantity_total
+        else:
+            if source.status != RequestStatus.OPEN:
+                raise BusinessConflict(
+                    "The request is no longer accepting offers.",
+                    code="source_not_accepting",
+                )
+            if source.valid_until <= now:
+                raise BusinessConflict(
+                    "The request validity period has passed.", code="deadline_passed"
+                )
+            if reservation.resource_deadline <= now:
+                raise BusinessConflict(
+                    "The offered resource deadline has passed.", code="deadline_passed"
+                )
+            total = source.quantity_needed
+            # Re-check terms against the (possibly edited) request.
+            mismatches = _offer_terms_mismatches(reservation, source)
+            if mismatches:
+                raise BusinessConflict(
+                    f"Reservation terms no longer match the source: {', '.join(mismatches)}.",
+                    code="terms_mismatch",
+                )
+
+        # Availability re-check excluding this reservation. Only ACCEPTED
+        # reservations hold allocation; this one is still PENDING.
+        allocated = source.reservations.filter(
+            status=ReservationStatus.ACCEPTED
+        ).aggregate(total=Sum("quantity"))["total"] or Decimal("0")
+        available = total - allocated
+        if reservation.quantity > available:
+            raise BusinessConflict(
+                f"Not enough quantity remains to accept this reservation ({available}).",
+                code="insufficient_quantity",
+            )
+
+        attrs["_total"] = total
+        attrs["_allocated_after"] = allocated + reservation.quantity
+        attrs["_now"] = now
+        return attrs
+
+    def save(self):
+        reservation = self.reservation
+        source = self.source_obj
+        now = self.validated_data["_now"]
+
+        # Capture the immutable snapshot of the agreed terms (same shape as the
+        # response ``terms``). The submitted price is preserved as-is. The terms
+        # dict holds a raw datetime for ``resource_deadline``; round-trip through
+        # the JSON renderer so the snapshot is JSON-safe for the JSONField.
+        terms = ReservationSerializer(reservation).data["terms"]
+        snapshot = json.loads(JSONRenderer().render(terms).decode())
+
+        reservation.status = ReservationStatus.ACCEPTED
+        reservation.accepted_at = now
+        reservation.accepted_snapshot = snapshot
+        reservation.version = reservation.version + 1
+        reservation.save(
+            update_fields=[
+                "status", "accepted_at", "accepted_snapshot", "version", "updated_at"
+            ]
+        )
+
+        # Recompute source status now that this reservation is ACCEPTED and
+        # therefore counts toward allocation. Full allocation flips the status.
+        fully_allocated = self.validated_data["_allocated_after"] >= self.validated_data["_total"]
+        if reservation.source_type == SourceType.LISTING_CLAIM:
+            if fully_allocated and source.status == ListingStatus.AVAILABLE:
+                source.status = ListingStatus.RESERVED
+                source.save(update_fields=["status", "updated_at"])
+        else:
+            if fully_allocated and source.status == RequestStatus.OPEN:
+                source.status = RequestStatus.ALLOCATED
+                source.save(update_fields=["status", "updated_at"])
+
         return reservation
