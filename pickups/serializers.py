@@ -10,16 +10,22 @@ RFC3339 = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:
 class PickupScheduleSerializer(serializers.Serializer):
     scheduled_at = serializers.DateTimeField()
     instructions = serializers.CharField(
-        max_length=2000, allow_null=True, required=False, default=None
+        max_length=2000, allow_null=True, allow_blank=True, required=False, default=None
     )
+
+    unknown_field_messages = {}
 
     def to_internal_value(self, data):
         if isinstance(data, dict):
             unknown = set(data) - set(self.fields)
             if unknown:
-                raise serializers.ValidationError(
-                    {name: [ErrorDetail("Field tidak dikenal.", code="unknown_field")] for name in sorted(unknown)}
-                )
+                raise serializers.ValidationError({
+                    name: [ErrorDetail(
+                        self.unknown_field_messages.get(name, "Field tidak dikenal."),
+                        code="unknown_field",
+                    )]
+                    for name in sorted(unknown)
+                })
         return super().to_internal_value(data)
 
     def validate_scheduled_at(self, value):
@@ -37,7 +43,7 @@ class PickupScheduleSerializer(serializers.Serializer):
         raw = self.initial_data.get("instructions")
         if raw is not None and not isinstance(raw, str):
             raise serializers.ValidationError("Harus berupa string atau null.", code="invalid")
-        return value
+        return value or None
 
 
 class PickupSerializer(serializers.ModelSerializer):
@@ -57,3 +63,33 @@ class PickupSerializer(serializers.ModelSerializer):
             "completed_at", "no_show_at", "cancelled_at",
         ]
         read_only_fields = fields
+        
+class PickupListQuerySerializer(serializers.Serializer):
+    status = serializers.ChoiceField(
+        choices=["SCHEDULED", "COMPLETED", "NO_SHOW", "CANCELLED"], required=False
+    )
+    role = serializers.ChoiceField(choices=["provider", "receiver"], required=False)
+    page = serializers.IntegerField(required=False)
+    page_size = serializers.IntegerField(min_value=1, max_value=100, required=False)
+ 
+    def to_internal_value(self, data):
+        unknown = set(data) - set(self.fields)
+        if unknown:
+            raise serializers.ValidationError(
+                {name: [ErrorDetail("Field tidak dikenal.", code="unknown_field")] for name in sorted(unknown)}
+            )
+        return super().to_internal_value(data)
+    
+class PickupUpdateSerializer(PickupScheduleSerializer):
+    scheduled_at = None
+    
+    unknown_field_messages = {
+        "scheduled_at": (
+            "Jadwal pickup tidak dapat diubah. Batalkan reservation "
+            "dan ajukan reservation baru untuk jadwal yang berbeda."
+        ),
+        "location": (
+            "Lokasi pickup tidak dapat diubah. Batalkan reservation "
+            "dan ajukan reservation baru untuk lokasi yang berbeda."
+        ),
+    }
