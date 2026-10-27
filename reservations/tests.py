@@ -273,7 +273,7 @@ def offer_payload(**overrides):
         unit_price="0.00",
         condition="Baru dikemas",
         suitability=["HUMAN_CONSUMPTION"],
-        location={"label": "Kampus UI Depok", "area": "Depok"},
+        location={"label": "Kampus UI Depok", "area": "Depok", "latitude": -6.36, "longitude": 106.82},
         quantity="5",
         resource_deadline=(timezone.now() + timedelta(days=1)).isoformat(),
     )
@@ -376,6 +376,27 @@ class RequestOfferTests(TestCase):
         past = (timezone.now() - timedelta(hours=1)).isoformat()
         res = self.client.post(
             self.url(self.request.pk), offer_payload(resource_deadline=past), format="json"
+        )
+        self.assertEqual(res.status_code, 400, res.data)
+
+    def test_incomplete_location_rejected(self):
+        self.auth(self.provider)
+        res = self.client.post(
+            self.url(self.request.pk),
+            offer_payload(location={"label": "Somewhere", "area": "Depok"}),
+            format="json",
+        )
+        self.assertEqual(res.status_code, 400, res.data)
+        fields = {e["field"] for e in res.data["errors"]}
+        self.assertIn("location.latitude", fields)
+        self.assertIn("location.longitude", fields)
+
+    def test_out_of_range_latitude_rejected(self):
+        self.auth(self.provider)
+        res = self.client.post(
+            self.url(self.request.pk),
+            offer_payload(location={"label": "X", "area": "Depok", "latitude": 999, "longitude": 0}),
+            format="json",
         )
         self.assertEqual(res.status_code, 400, res.data)
 

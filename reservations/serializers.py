@@ -9,6 +9,7 @@ from rest_framework.renderers import JSONRenderer
 
 from common.exceptions import BusinessConflict
 from listings.models import ListingStatus
+from pickups.serializers import PickupSerializer
 from requests_app.models import RequestStatus
 from shared.enums import Mode, ResourceType, Suitability, Unit
 from .models import Reservation, ReservationStatus, SourceType
@@ -34,6 +35,19 @@ class UserRefSerializer(serializers.Serializer):
 
     id = serializers.IntegerField()
     display_name = serializers.CharField()
+
+
+class LocationSerializer(serializers.Serializer):
+    """Resource location per the contract (sections 7.2.2 / 7.4.2).
+
+    ``label`` 1-300, ``area`` 1-100, ``latitude`` -90..90, ``longitude``
+    -180..180. Validated as a nested object rather than a free-form blob.
+    """
+
+    label = serializers.CharField(max_length=300, min_length=1)
+    area = serializers.CharField(max_length=100, min_length=1)
+    latitude = serializers.FloatField(min_value=-90, max_value=90)
+    longitude = serializers.FloatField(min_value=-180, max_value=180)
 
 
 class ReservationSerializer(serializers.Serializer):
@@ -109,7 +123,9 @@ class ReservationSerializer(serializers.Serializer):
         pickup = getattr(obj, "pickup", None)
         if pickup is None:
             return None
-        return PickupRefSerializer(pickup).data
+        # Reuse the pickups app serializer so the nested pickup shape stays in
+        # one place (section 7.5).
+        return PickupSerializer(pickup).data
 
     def get_counterparty_contact(self, obj):
         """Contact of the transaction partner, relative to the viewer.
@@ -261,7 +277,7 @@ class RequestOfferCreateSerializer(serializers.Serializer):
     suitability = serializers.ListField(
         child=serializers.ChoiceField(choices=Suitability.choices), allow_empty=False
     )
-    location = serializers.JSONField()
+    location = LocationSerializer()
     storage_notes = serializers.CharField(max_length=2000, required=False, allow_null=True, default=None)
     allergen_notes = serializers.CharField(max_length=2000, required=False, allow_null=True, default=None)
     packaging_status = serializers.CharField(max_length=200, required=False, allow_null=True, default=None)
