@@ -5,6 +5,7 @@ import json
 from django.db.models import Sum
 from django.utils import timezone
 from rest_framework import serializers
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.renderers import JSONRenderer
 
 from common.exceptions import BusinessConflict
@@ -156,6 +157,34 @@ class ReservationSerializer(serializers.Serializer):
             "whatsapp_number": other.whatsapp_number,
             "whatsapp_url": None,
         }
+
+
+def _contact_of(user):
+    """Admin-visible contact for a party (section 7.4.10). Always includes the
+    user id; whatsapp_number is null when not filled."""
+    return {
+        "user_id": user.id,
+        "whatsapp_number": user.whatsapp_number or None,
+        "whatsapp_url": None,
+    }
+
+
+class AdminReservationSerializer(ReservationSerializer):
+    """Reservation representation for admin moderation (section 7.4.10).
+
+    Adds both parties' contacts, available in every status for moderation. The
+    inherited ``counterparty_contact`` stays viewer-relative (null for a
+    non-participant admin); the admin-only fields below carry the contacts.
+    """
+
+    provider_contact = serializers.SerializerMethodField()
+    receiver_contact = serializers.SerializerMethodField()
+
+    def get_provider_contact(self, obj):
+        return _contact_of(obj.provider)
+
+    def get_receiver_contact(self, obj):
+        return _contact_of(obj.receiver)
 
 
 class ListingClaimCreateSerializer(serializers.Serializer):
@@ -419,10 +448,12 @@ class ReservationReviseSerializer(serializers.Serializer):
 
     quantity = serializers.DecimalField(max_digits=15, decimal_places=3, required=False)
     expected_version = serializers.IntegerField()
+    reason = serializers.CharField(min_length=1, max_length=1000, required=False)
 
-    def __init__(self, *args, reservation=None, user=None, **kwargs):
+    def __init__(self, *args, reservation=None, user=None, is_admin=False, **kwargs):
         self.reservation = reservation
         self.user = user
+        self.is_admin = is_admin
         super().__init__(*args, **kwargs)
 
     def validate_quantity(self, value):
@@ -437,6 +468,10 @@ class ReservationReviseSerializer(serializers.Serializer):
 
     def validate(self, attrs):
         reservation = self.reservation
+
+        # Admin moderation requires a reason for the audit trail.
+        if self.is_admin and not attrs.get("reason"):
+            raise serializers.ValidationError({"reason": "This field is required."})
 
         # Only PENDING submissions can be revised.
         if reservation.status != ReservationStatus.PENDING:
@@ -483,7 +518,12 @@ class ReservationReviseSerializer(serializers.Serializer):
         reservation = self.reservation
         reservation.quantity = self.validated_data["quantity"]
         reservation.version = reservation.version + 1
-        reservation.save(update_fields=["quantity", "version", "updated_at"])
+        update_fields = ["quantity", "version", "updated_at"]
+        reason = self.validated_data.get("reason")
+        if reason:
+            reservation.reason = reason
+            update_fields.append("reason")
+        reservation.save(update_fields=update_fields)
         return reservation
 
 
@@ -539,19 +579,25 @@ class ReservationAcceptSerializer(serializers.Serializer):
     """
 
     expected_version = serializers.IntegerField()
+    reason = serializers.CharField(min_length=1, max_length=1000, required=False)
 
-    def __init__(self, *args, reservation=None, user=None, source_obj=None, **kwargs):
+    def __init__(self, *args, reservation=None, user=None, source_obj=None, is_admin=False, **kwargs):
         # NOTE: ``source`` is reserved by DRF's Field/Serializer machinery, so
         # the locked source row is stored as ``source_obj``.
         self.reservation = reservation
         self.user = user
         self.source_obj = source_obj  # the locked ResourceListing or ResourceRequest
+        self.is_admin = is_admin
         super().__init__(*args, **kwargs)
 
     def validate(self, attrs):
         reservation = self.reservation
         user = self.user
         source = self.source_obj
+
+        # Admin moderation requires a reason for the audit trail.
+        if self.is_admin and not attrs.get("reason"):
+            raise serializers.ValidationError({"reason": "This field is required."})
 
         # Only PENDING reservations can be accepted.
         if reservation.status != ReservationStatus.PENDING:
@@ -561,16 +607,19 @@ class ReservationAcceptSerializer(serializers.Serializer):
             )
 
         # Authorization: claim is approved by the provider, offer by the
-        # receiver. (Non-participants never reach here; the view hides them.)
-        if reservation.source_type == SourceType.LISTING_CLAIM:
-            approver_id = reservation.provider_id
-        else:
-            approver_id = reservation.receiver_id
-        if user.id != approver_id:
-            raise BusinessConflict(
-                "You are not allowed to accept this reservation.",
-                code="invalid_transition",
-            )
+        # receiver. An admin moderator may accept on anyone's behalf (override
+        # is authorization only — every other invariant below still applies).
+        # A participant who is not the designated approver is unauthorized
+        # (403 permission_denied), per the section 7.4.6 access contract.
+        if not self.is_admin:
+            if reservation.source_type == SourceType.LISTING_CLAIM:
+                approver_id = reservation.provider_id
+            else:
+                approver_id = reservation.receiver_id
+            if user.id != approver_id:
+                raise PermissionDenied(
+                    "You are not allowed to accept this reservation."
+                )
 
         # Optimistic concurrency: the approver must have seen the latest version.
         if attrs["expected_version"] != reservation.version:
@@ -648,11 +697,14 @@ class ReservationAcceptSerializer(serializers.Serializer):
         reservation.accepted_at = now
         reservation.accepted_snapshot = snapshot
         reservation.version = reservation.version + 1
-        reservation.save(
-            update_fields=[
-                "status", "accepted_at", "accepted_snapshot", "version", "updated_at"
-            ]
-        )
+        update_fields = [
+            "status", "accepted_at", "accepted_snapshot", "version", "updated_at"
+        ]
+        reason = self.validated_data.get("reason")
+        if reason:
+            reservation.reason = reason
+            update_fields.append("reason")
+        reservation.save(update_fields=update_fields)
 
         # Recompute source status now that this reservation is ACCEPTED and
         # therefore counts toward allocation. Full allocation flips the status.
@@ -680,9 +732,10 @@ class ReservationRejectSerializer(serializers.Serializer):
     reason = serializers.CharField(min_length=1, max_length=1000)
     expected_version = serializers.IntegerField()
 
-    def __init__(self, *args, reservation=None, user=None, **kwargs):
+    def __init__(self, *args, reservation=None, user=None, is_admin=False, **kwargs):
         self.reservation = reservation
         self.user = user
+        self.is_admin = is_admin
         super().__init__(*args, **kwargs)
 
     def validate(self, attrs):
@@ -695,16 +748,19 @@ class ReservationRejectSerializer(serializers.Serializer):
                 code="invalid_transition",
             )
 
-        # Approver = provider for a claim, receiver for an offer.
-        if reservation.source_type == SourceType.LISTING_CLAIM:
-            approver_id = reservation.provider_id
-        else:
-            approver_id = reservation.receiver_id
-        if user.id != approver_id:
-            raise BusinessConflict(
-                "You are not allowed to reject this reservation.",
-                code="invalid_transition",
-            )
+        # Approver = provider for a claim, receiver for an offer. An admin
+        # moderator may reject on anyone's behalf (authorization override only).
+        # A participant who is not the approver is unauthorized (403
+        # permission_denied), per the section 7.4.7 access contract.
+        if not self.is_admin:
+            if reservation.source_type == SourceType.LISTING_CLAIM:
+                approver_id = reservation.provider_id
+            else:
+                approver_id = reservation.receiver_id
+            if user.id != approver_id:
+                raise PermissionDenied(
+                    "You are not allowed to reject this reservation."
+                )
 
         if attrs["expected_version"] != reservation.version:
             raise BusinessConflict(

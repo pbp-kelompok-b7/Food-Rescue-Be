@@ -928,11 +928,10 @@ class ReservationAcceptTests(TestCase):
 
     # --- permission / wrong approver -------------------------------------
     def test_claim_receiver_cannot_accept(self):
-        # Receiver is the submitter of a claim, not the approver.
+        # Receiver is the submitter of a claim, not the approver -> 403.
         self.auth(self.receiver)
         res = self.accept(self.res.pk, 1)
-        self.assertEqual(res.status_code, 409, res.data)
-        self.assertIn("invalid_transition", error_codes(res))
+        self.assertEqual(res.status_code, 403, res.data)
 
     def test_outsider_gets_404(self):
         self.auth(self.outsider)
@@ -1091,11 +1090,10 @@ class ReservationRejectTests(TestCase):
         self.assertEqual(self.listing.status, ListingStatus.AVAILABLE)
 
     def test_submitter_cannot_reject(self):
-        # Receiver submitted the claim; only the provider (approver) may reject.
+        # Receiver submitted the claim; only the provider (approver) may reject -> 403.
         self.auth(self.receiver)
         res = self.reject(self.res.pk, 1)
-        self.assertEqual(res.status_code, 409, res.data)
-        self.assertIn("invalid_transition", error_codes(res))
+        self.assertEqual(res.status_code, 403, res.data)
 
     def test_outsider_gets_404(self):
         self.auth(self.outsider)
@@ -1270,3 +1268,199 @@ class ReservationCancelTests(TestCase):
         res = self.cancel(self.res.pk)
         self.assertEqual(res.status_code, 409, res.data)
         self.assertIn("invalid_transition", error_codes(res))
+
+
+class AdminReservationTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.provider = make_user("adm_provider@example.com", whatsapp_number="+628111111111")
+        self.receiver = make_user("adm_receiver@example.com", whatsapp_number="+628222222222")
+        self.admin = make_admin("adm_admin@example.com")
+        self.listing = make_listing(self.provider, quantity_total=Decimal("20"))
+        self.res = make_claim_reservation(self.listing, self.receiver, quantity=Decimal("5"))
+
+    def auth(self, user):
+        self.client.force_authenticate(user)
+
+    # --- list -------------------------------------------------------------
+    def test_admin_lists_all_reservations(self):
+        # A reservation the admin is not part of still shows.
+        other = make_user("adm_other@example.com")
+        make_claim_reservation(self.listing, other, quantity=Decimal("2"))
+        self.auth(self.admin)
+        res = self.client.get("/api/v1/admin/reservations/")
+        self.assertEqual(res.status_code, 200, res.data)
+        self.assertEqual(res.data["data"]["count"], 2)
+
+    def test_non_admin_forbidden_on_list(self):
+        self.auth(self.provider)
+        self.assertEqual(self.client.get("/api/v1/admin/reservations/").status_code, 403)
+
+    def test_anonymous_forbidden_on_list(self):
+        self.assertEqual(self.client.get("/api/v1/admin/reservations/").status_code, 401)
+
+    def test_admin_list_filters(self):
+        self.auth(self.admin)
+        self.assertEqual(
+            self.client.get("/api/v1/admin/reservations/?status=PENDING").data["data"]["count"], 1
+        )
+        self.assertEqual(
+            self.client.get(f"/api/v1/admin/reservations/?provider_id={self.provider.id}").data["data"]["count"], 1
+        )
+        self.assertEqual(
+            self.client.get("/api/v1/admin/reservations/?status=ACCEPTED").data["data"]["count"], 0
+        )
+
+    def test_admin_list_invalid_filter(self):
+        self.auth(self.admin)
+        self.assertEqual(self.client.get("/api/v1/admin/reservations/?status=BOGUS").status_code, 400)
+        self.assertEqual(self.client.get("/api/v1/admin/reservations/?provider_id=abc").status_code, 400)
+
+    # --- detail with both-party contacts ---------------------------------
+    def test_admin_detail_shows_both_contacts(self):
+        self.auth(self.admin)
+        res = self.client.get(f"/api/v1/admin/reservations/{self.res.pk}/")
+        self.assertEqual(res.status_code, 200, res.data)
+        data = res.data["data"]
+        self.assertEqual(data["provider_contact"]["user_id"], self.provider.id)
+        self.assertEqual(data["provider_contact"]["whatsapp_number"], "+628111111111")
+        self.assertEqual(data["receiver_contact"]["user_id"], self.receiver.id)
+        self.assertEqual(data["receiver_contact"]["whatsapp_number"], "+628222222222")
+
+    def test_admin_detail_contacts_in_pending_status(self):
+        # Admin sees contacts even while PENDING (moderation), unlike participants.
+        self.auth(self.admin)
+        res = self.client.get(f"/api/v1/admin/reservations/{self.res.pk}/")
+        self.assertEqual(res.data["data"]["status"], ReservationStatus.PENDING)
+        self.assertIsNotNone(res.data["data"]["provider_contact"])
+
+    def test_non_admin_forbidden_on_detail(self):
+        self.auth(self.receiver)
+        self.assertEqual(self.client.get(f"/api/v1/admin/reservations/{self.res.pk}/").status_code, 403)
+
+    # --- admin PATCH ------------------------------------------------------
+    def test_admin_patch_requires_reason(self):
+        self.auth(self.admin)
+        res = self.client.patch(
+            f"/api/v1/admin/reservations/{self.res.pk}/",
+            {"quantity": "8", "expected_version": 1},
+            format="json",
+        )
+        self.assertEqual(res.status_code, 400, res.data)
+
+    def test_admin_patch_revises_quantity(self):
+        self.auth(self.admin)
+        res = self.client.patch(
+            f"/api/v1/admin/reservations/{self.res.pk}/",
+            {"quantity": "8", "expected_version": 1, "reason": "Correction."},
+            format="json",
+        )
+        self.assertEqual(res.status_code, 200, res.data)
+        self.assertEqual(Decimal(res.data["data"]["terms"]["quantity"]), Decimal("8"))
+
+    def test_admin_patch_stale_version(self):
+        self.auth(self.admin)
+        res = self.client.patch(
+            f"/api/v1/admin/reservations/{self.res.pk}/",
+            {"quantity": "8", "expected_version": 99, "reason": "x"},
+            format="json",
+        )
+        self.assertEqual(res.status_code, 409, res.data)
+        self.assertIn("stale_version", error_codes(res))
+
+    # --- admin accept -----------------------------------------------------
+    def test_admin_accepts_on_behalf(self):
+        self.auth(self.admin)
+        res = self.client.post(
+            f"/api/v1/admin/reservations/{self.res.pk}/accept/",
+            {"expected_version": 1, "reason": "Approved by moderator."},
+            format="json",
+        )
+        self.assertEqual(res.status_code, 200, res.data)
+        self.assertEqual(res.data["data"]["status"], ReservationStatus.ACCEPTED)
+
+    def test_admin_accept_requires_reason(self):
+        self.auth(self.admin)
+        res = self.client.post(
+            f"/api/v1/admin/reservations/{self.res.pk}/accept/",
+            {"expected_version": 1},
+            format="json",
+        )
+        self.assertEqual(res.status_code, 400, res.data)
+
+    def test_admin_accept_still_enforces_invariants(self):
+        # Override is authorization only: a past-deadline listing still fails.
+        self.listing.available_until = timezone.now() - timedelta(hours=1)
+        self.listing.save(update_fields=["available_until"])
+        self.auth(self.admin)
+        res = self.client.post(
+            f"/api/v1/admin/reservations/{self.res.pk}/accept/",
+            {"expected_version": 1, "reason": "x"},
+            format="json",
+        )
+        self.assertEqual(res.status_code, 409, res.data)
+        self.assertIn("deadline_passed", error_codes(res))
+
+    def test_admin_accept_overquantity_still_fails(self):
+        big = make_claim_reservation(self.listing, self.receiver, quantity=Decimal("25"))
+        self.auth(self.admin)
+        res = self.client.post(
+            f"/api/v1/admin/reservations/{big.pk}/accept/",
+            {"expected_version": 1, "reason": "x"},
+            format="json",
+        )
+        self.assertEqual(res.status_code, 409, res.data)
+        self.assertIn("insufficient_quantity", error_codes(res))
+
+    # --- admin reject -----------------------------------------------------
+    def test_admin_rejects_on_behalf(self):
+        self.auth(self.admin)
+        res = self.client.post(
+            f"/api/v1/admin/reservations/{self.res.pk}/reject/",
+            {"expected_version": 1, "reason": "Rejected by moderator."},
+            format="json",
+        )
+        self.assertEqual(res.status_code, 200, res.data)
+        self.assertEqual(res.data["data"]["status"], ReservationStatus.REJECTED)
+
+    def test_admin_reject_terminal_conflict(self):
+        self.res.status = ReservationStatus.ACCEPTED
+        self.res.save(update_fields=["status"])
+        self.auth(self.admin)
+        res = self.client.post(
+            f"/api/v1/admin/reservations/{self.res.pk}/reject/",
+            {"expected_version": 1, "reason": "x"},
+            format="json",
+        )
+        self.assertEqual(res.status_code, 409, res.data)
+        self.assertIn("invalid_transition", error_codes(res))
+
+    # --- admin cancel -----------------------------------------------------
+    def test_admin_cancels_on_behalf(self):
+        self.auth(self.admin)
+        res = self.client.post(
+            f"/api/v1/admin/reservations/{self.res.pk}/cancel/",
+            {"reason": "Cancelled by moderator."},
+            format="json",
+        )
+        self.assertEqual(res.status_code, 200, res.data)
+        self.assertEqual(res.data["data"]["status"], ReservationStatus.CANCELLED)
+
+    def test_admin_cancel_requires_reason(self):
+        self.auth(self.admin)
+        res = self.client.post(
+            f"/api/v1/admin/reservations/{self.res.pk}/cancel/", {}, format="json"
+        )
+        self.assertEqual(res.status_code, 400, res.data)
+
+    def test_non_admin_forbidden_on_admin_actions(self):
+        self.auth(self.receiver)
+        for action, body in (
+            ("accept", {"expected_version": 1, "reason": "x"}),
+            ("reject", {"expected_version": 1, "reason": "x"}),
+            ("cancel", {"reason": "x"}),
+        ):
+            res = self.client.post(
+                f"/api/v1/admin/reservations/{self.res.pk}/{action}/", body, format="json"
+            )
+            self.assertEqual(res.status_code, 403, f"{action}: {res.data}")

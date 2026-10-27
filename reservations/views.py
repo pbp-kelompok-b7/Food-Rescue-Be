@@ -11,6 +11,7 @@ from listings.models import ResourceListing
 from requests_app.models import ResourceRequest
 from .models import Reservation, ReservationStatus, SourceType
 from .serializers import (
+    AdminReservationSerializer,
     ListingClaimCreateSerializer,
     ReservationAcceptSerializer,
     ReservationCancelSerializer,
@@ -49,7 +50,11 @@ def listings_detail_claims(request, pk):
         )
         serializer.is_valid(raise_exception=True)
         reservation = serializer.save()
-    return success(ReservationSerializer(reservation).data, status=201)
+    return success(
+        ReservationSerializer(reservation).data,
+        message="Claim berhasil diajukan",
+        status=201,
+    )
 
 
 # POST /api/v1/requests/<int:pk>/offers/
@@ -295,8 +300,42 @@ def reservations_detail_cancel(request, pk):
 @api_view(['GET'])
 @permission_classes([IsAdminUser])
 def admin_reservations(request):
-    # TODO: implement this operation.
-    return failure('Endpoint belum diimplementasikan.', [{'field': None, 'code': 'not_implemented', 'message': 'Business logic pending.'}], status=501)
+    """List all reservations for moderation (section 7.4.9).
+
+    Filters: status, provider_id, receiver_id, source_type. Paginated, ordered
+    -created_at, -id. Not scoped to the caller (admin sees everything).
+    """
+    qs = (
+        Reservation.objects.select_related(*_RESERVATION_SELECT_RELATED)
+        .all()
+        .order_by("-created_at", "-id")
+    )
+
+    status_param = request.query_params.get("status")
+    if status_param is not None:
+        if status_param not in ReservationStatus.values:
+            raise ValidationError({"status": "Unknown reservation status."})
+        qs = qs.filter(status=status_param)
+
+    source_type = request.query_params.get("source_type")
+    if source_type is not None:
+        if source_type not in SourceType.values:
+            raise ValidationError({"source_type": "Unknown source type."})
+        qs = qs.filter(source_type=source_type)
+
+    for param in ("provider_id", "receiver_id"):
+        raw = request.query_params.get(param)
+        if raw is not None:
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                raise ValidationError({param: "Must be an integer."})
+            qs = qs.filter(**{param: value})
+
+    paginator = ContractPagination()
+    page = paginator.paginate_queryset(qs, request)
+    data = AdminReservationSerializer(page, many=True).data
+    return paginator.get_paginated_response(data)
 
 
 # GET, PATCH /api/v1/admin/reservations/<int:pk>/
@@ -304,32 +343,91 @@ def admin_reservations(request):
 @permission_classes([IsAdminUser])
 def admin_reservations_detail(request, pk):
     if request.method == "GET":
-        # TODO: implement this operation.
-        return failure('Endpoint belum diimplementasikan.', [{'field': None, 'code': 'not_implemented', 'message': 'Business logic pending.'}], status=501)
+        # Admin reads any reservation, with both parties' contacts (7.4.10).
+        reservation = get_object_or_404(
+            Reservation.objects.select_related(*_RESERVATION_SELECT_RELATED), pk=pk
+        )
+        return success(AdminReservationSerializer(reservation).data)
+
     if request.method == "PATCH":
-        # TODO: implement this operation.
-        return failure('Endpoint belum diimplementasikan.', [{'field': None, 'code': 'not_implemented', 'message': 'Business logic pending.'}], status=501)
+        # Revise the pending quantity as a moderator (7.4.11). reason required;
+        # no submitter restriction, all other revise rules apply.
+        with transaction.atomic():
+            reservation = get_object_or_404(
+                Reservation.objects.select_for_update(of=("self",)), pk=pk
+            )
+            serializer = ReservationReviseSerializer(
+                data=request.data, reservation=reservation, user=request.user, is_admin=True
+            )
+            serializer.is_valid(raise_exception=True)
+            serializer.save()
+        reservation.refresh_from_db()
+        return success(
+            AdminReservationSerializer(reservation).data,
+            message="Perubahan berhasil disimpan",
+        )
 
 
 # POST /api/v1/admin/reservations/<int:pk>/accept/
 @api_view(['POST'])
 @permission_classes([IsAdminUser])
 def admin_reservations_detail_accept(request, pk):
-    # TODO: implement this operation.
-    return failure('Endpoint belum diimplementasikan.', [{'field': None, 'code': 'not_implemented', 'message': 'Business logic pending.'}], status=501)
+    """Accept a reservation as a moderator (section 7.4.12).
+
+    Same transaction/allocation/snapshot rules as the participant endpoint; the
+    admin override is authorization only. reason required.
+    """
+    with transaction.atomic():
+        reservation, source = _lock_source_then_reservation(pk)
+        serializer = ReservationAcceptSerializer(
+            data=request.data,
+            reservation=reservation,
+            user=request.user,
+            source_obj=source,
+            is_admin=True,
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+    reservation.refresh_from_db()
+    return success(AdminReservationSerializer(reservation).data, message="Pengajuan diterima")
 
 
 # POST /api/v1/admin/reservations/<int:pk>/reject/
 @api_view(['POST'])
 @permission_classes([IsAdminUser])
 def admin_reservations_detail_reject(request, pk):
-    # TODO: implement this operation.
-    return failure('Endpoint belum diimplementasikan.', [{'field': None, 'code': 'not_implemented', 'message': 'Business logic pending.'}], status=501)
+    """Reject a PENDING reservation as a moderator (section 7.4.13)."""
+    with transaction.atomic():
+        reservation = get_object_or_404(
+            Reservation.objects.select_for_update(of=("self",)), pk=pk
+        )
+        serializer = ReservationRejectSerializer(
+            data=request.data, reservation=reservation, user=request.user, is_admin=True
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+    reservation.refresh_from_db()
+    return success(AdminReservationSerializer(reservation).data, message="Pengajuan ditolak")
 
 
 # POST /api/v1/admin/reservations/<int:pk>/cancel/
 @api_view(['POST'])
 @permission_classes([IsAdminUser])
 def admin_reservations_detail_cancel(request, pk):
-    # TODO: implement this operation.
-    return failure('Endpoint belum diimplementasikan.', [{'field': None, 'code': 'not_implemented', 'message': 'Business logic pending.'}], status=501)
+    """Cancel a reservation as a moderator (section 7.4.14).
+
+    Same allocation-release / pickup / source-reopen rules as the participant
+    endpoint. reason required (the cancel serializer already requires it).
+    """
+    with transaction.atomic():
+        reservation, source = _lock_source_then_reservation(pk)
+        serializer = ReservationCancelSerializer(
+            data=request.data,
+            reservation=reservation,
+            user=request.user,
+            source_obj=source,
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+    reservation.refresh_from_db()
+    return success(AdminReservationSerializer(reservation).data, message="Reservation dibatalkan")
