@@ -8,18 +8,8 @@ from rest_framework import serializers
 
 from common.exceptions import BusinessConflict
 from shared.enums import ResourceType, Suitability, Unit
+from shared.reference_data import CATEGORY_RESOURCE_TYPES
 from .models import ResourceRequest, RequestStatus
-
-
-# Proposed seed vocabulary from Technical Design Revision 2, section 7.6.1.
-CATEGORY_RESOURCE_TYPES = {
-    "prepared_meal": ResourceType.PACKAGED_FOOD_SURPLUS,
-    "bakery": ResourceType.PACKAGED_FOOD_SURPLUS,
-    "snack": ResourceType.PACKAGED_FOOD_SURPLUS,
-    "coffee_grounds": ResourceType.COMPOSTABLE_FOOD_WASTE,
-    "fruit_vegetable_scraps": ResourceType.COMPOSTABLE_FOOD_WASTE,
-    "eggshells": ResourceType.COMPOSTABLE_FOOD_WASTE,
-}
 
 
 class RequestQuerySerializer(serializers.Serializer):

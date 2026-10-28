@@ -1,5 +1,6 @@
 from django.conf import settings
 from django.db import models
+from django.utils import timezone
 
 
 class AuditEvent(models.Model):
@@ -13,3 +14,17 @@ class AuditEvent(models.Model):
 
     class Meta:
         ordering = ["-created_at", "-pk"]
+
+
+class LocationSearchCache(models.Model):
+    # Hash includes provider, query, area and limit; raw search text is not stored.
+    key = models.CharField(max_length=64, primary_key=True)
+    results = models.JSONField(default=list)
+    expires_at = models.DateTimeField(db_index=True)
+
+
+class LocationProviderState(models.Model):
+    """One database-backed gate per provider host, shared by every worker."""
+
+    key = models.CharField(max_length=64, primary_key=True)
+    next_request_at = models.DateTimeField(default=timezone.now)
