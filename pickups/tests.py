@@ -1,21 +1,30 @@
 from datetime import timedelta
+from unittest import mock
 import threading
 
-from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.db import IntegrityError, connection, connections, transaction
-from django.middleware.csrf import _get_new_csrf_string, _mask_cipher_secret
-from django.test import TestCase, TransactionTestCase
+from django.db.models import Q
+from django.db.models.aggregates import Sum
+from django.test import TestCase, TransactionTestCase, override_settings
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 from rest_framework.test import APIClient
 
-from listings.models import ResourceListing
+from listings.models import ListingStatus, ResourceListing
 from reservations.models import Reservation, ReservationStatus, SourceType
+from requests_app.models import RequestStatus, ResourceRequest
 from pickups.models import Pickup
 from shared.enums import ResourceType, Mode, Unit
+from shared.models import AuditEvent
+
+FAST_HASHER = override_settings(
+    PASSWORD_HASHERS=["django.contrib.auth.hashers.MD5PasswordHasher"]
+)
 
 User = get_user_model()
+PROVIDER_WA = "+6281211110001"
+RECEIVER_WA = "+6281211110002"
 
 RESPONSE_FIELDS = {
     "id", "created_at", "updated_at", "version", "reservation_id", "scheduled_at",
@@ -32,6 +41,7 @@ OTHER_LOCATION = {
 }
 
 
+# ---------------------------------------------------------------- Factories
 def make_user(email, *, whatsapp="+6281200000000", is_admin=False, **extra):
     """Create the project's custom User (email login; no username field)."""
     user = User.objects.create_user(
@@ -101,6 +111,55 @@ def make_reservation(provider, receiver, *, status="ACCEPTED", deadline=None,
     )
 
 
+def make_request_reservation(provider, receiver, source, quantity, deadline):
+    """Create an ACCEPTED reservation backed by a ResourceRequest (offer path)."""
+    snapshot = {
+        "resource_type": ResourceType.PACKAGED_FOOD_SURPLUS,
+        "title": source.title,
+        "quantity": str(quantity),
+        "unit": Unit.BOX,
+        "mode": Mode.DONATE,
+        "unit_price": "0.00",
+        "total_price": "0.00",
+        "location": SNAPSHOT_LOCATION,
+        "resource_deadline": deadline.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    return Reservation.objects.create(
+        source_type=SourceType.REQUEST_OFFER,
+        request=source,
+        provider=provider,
+        receiver=receiver,
+        submitted_by=provider,
+        quantity=quantity,
+        unit=Unit.BOX,
+        mode=Mode.DONATE,
+        unit_price="0.00",
+        resource_data={},
+        resource_deadline=deadline,
+        accepted_snapshot=snapshot,
+        accepted_at=timezone.now(),
+        status=ReservationStatus.ACCEPTED,
+    )
+
+
+def make_test_request(owner, *, quantity="5.000", status=RequestStatus.OPEN):
+    return ResourceRequest.objects.create(
+        owner=owner,
+        created_by=owner,
+        title="Need rice",
+        description="Pickup test",
+        resource_type=ResourceType.PACKAGED_FOOD_SURPLUS,
+        category="Prepared food",
+        intended_use="HUMAN_CONSUMPTION",
+        quantity_needed=quantity,
+        unit=Unit.BOX,
+        location=SNAPSHOT_LOCATION,
+        donate_only=True,
+        valid_until=timezone.now() + timedelta(days=30),
+        status=status,
+    )
+
+
 def change_source_location(reservation, new_location):
     """Change the live listing; accepted_snapshot should remain unchanged."""
     source = reservation.listing
@@ -108,16 +167,17 @@ def change_source_location(reservation, new_location):
     source.save()
 
 
-def make_pickup(reservation, status="SCHEDULED"):
+def make_pickup(reservation, scheduled_at=None, status="SCHEDULED"):
     return Pickup.objects.create(
         reservation=reservation,
-        scheduled_at=timezone.now() + timedelta(days=1),
+        scheduled_at=scheduled_at or (timezone.now() + timedelta(days=1)),
         location=reservation.accepted_snapshot["location"],
         status=status,
     )
 
 
-# ---------------------------------------------------------------- base class
+# ---------------------------------------------------------------- Shared base: create
+@FAST_HASHER
 class PickupCreateBase(TestCase):
     def setUp(self):
         self.provider = make_user("provider")
@@ -166,8 +226,119 @@ class PickupCreateBase(TestCase):
     def assertNoPickup(self):
         self.assertEqual(Pickup.objects.count(), 0, "failed request must not create a pickup")
 
+    def csrf_token_for(self, client):
+        """Start the CSRF flow like the frontend does (contract 7.1.1)."""
+        resp = client.get("/api/v1/auth/csrf/")
+        assert resp.status_code == 200, resp.content
+        return resp.json()["data"]["csrf_token"]
 
-# ---------------------------------------------------------------- happy path
+
+# ---------------------------------------------------------------- Shared base: list, detail, update
+class PickupReadUpdateBase(PickupCreateBase):
+    def setUp(self):
+        super().setUp()
+        self.provider.whatsapp_number = PROVIDER_WA
+        self.provider.save()
+        self.receiver.whatsapp_number = RECEIVER_WA
+        self.receiver.save()
+
+        self.pickup = make_pickup(self.reservation, self.scheduled)
+
+    # helpers
+    def client_for(self, user, **kwargs):
+        client = APIClient(**kwargs)
+        client.force_login(user)
+        return client
+
+    def list_url(self):
+        return "/api/v1/pickups/"
+
+    def detail_url(self, pk=None):
+        return f"/api/v1/pickups/{self.pickup.pk if pk is None else pk}/"
+
+    def get_list(self, user=None, client=None, **params):
+        client = client or self.client_for(user or self.provider)
+        return client.get(self.list_url(), params)
+
+    def get_detail(self, user=None, client=None, pk=None):
+        client = client or self.client_for(user or self.provider)
+        return client.get(self.detail_url(pk))
+
+    def patch(self, body=None, client=None, pk=None):
+        body = {"instructions": "Temui petugas di lobi"} if body is None else body
+        return (client or self.client).patch(self.detail_url(pk), body, format="json")
+
+    def snapshot_of(self, pickup):
+        pickup.refresh_from_db()
+        return (
+            pickup.version, pickup.instructions, pickup.scheduled_at,
+            pickup.location, pickup.status, pickup.updated_at,
+        )
+
+    def assertPickupSchema(self, data):
+        self.assertEqual(set(data), RESPONSE_FIELDS)
+
+    def assertNoContactLeak(self, resp):
+        text = resp.content.decode("utf-8")
+        for secret in (PROVIDER_WA, RECEIVER_WA, "whatsapp"):
+            self.assertNotIn(secret, text, "pickup response must not leak contact data")
+
+    def make_other_pickup(self, provider=None, receiver=None, status="SCHEDULED", when=None):
+        res = make_reservation(
+            provider or self.provider, receiver or self.receiver, deadline=self.deadline
+        )
+        return make_pickup(res, when or self.scheduled, status=status)
+
+
+# ---------------------------------------------------------------- Shared base: complete and no-show
+@FAST_HASHER
+class PickupActionBase(TestCase):
+    def setUp(self):
+        self.provider = make_user("action-provider", whatsapp=PROVIDER_WA)
+        self.receiver = make_user("action-receiver", whatsapp=RECEIVER_WA)
+        self.admin = make_user("action-admin", is_admin=True)
+        self.deadline = (timezone.now() + timedelta(days=2)).replace(microsecond=0)
+
+    def listing_scenario(self, *, total="5.000", quantity="5.000", status=ListingStatus.AVAILABLE,
+                         scheduled_at=None):
+        reservation = make_reservation(self.provider, self.receiver, deadline=self.deadline)
+        listing = reservation.listing
+        listing.quantity_total = total
+        listing.status = status
+        listing.save(update_fields=["quantity_total", "status", "updated_at"])
+        reservation.quantity = quantity
+        reservation.save(update_fields=["quantity"])
+        pickup = make_pickup(
+            reservation, scheduled_at or timezone.now() - timedelta(hours=1)
+        )
+        return listing, reservation, pickup
+
+    def request_scenario(self, *, quantity="5.000", status=RequestStatus.OPEN,
+                         scheduled_at=None):
+        source = make_test_request(self.receiver, quantity=quantity, status=status)
+        reservation = make_request_reservation(
+            self.provider, self.receiver, source, quantity, self.deadline
+        )
+        pickup = make_pickup(
+            reservation, scheduled_at or timezone.now() - timedelta(hours=1)
+        )
+        return source, reservation, pickup
+
+    def post(self, user, action, pickup, body):
+        client = APIClient()
+        client.force_login(user)
+        return client.post(f"/api/v1/pickups/{pickup.pk}/{action}/", body, format="json")
+
+    def assert_error(self, response, status, code=None):
+        self.assertEqual(response.status_code, status, response.content)
+        if code:
+            self.assertIn(code, [error["code"] for error in response.json()["errors"]])
+
+
+# ================================================================ Create pickup
+# POST /api/v1/reservations/{id}/pickup/
+
+# ---------------------------------------------------------------- Create: success
 class PickupCreateSuccessTests(PickupCreateBase):
     def test_provider_creates_pickup_201_with_contract_schema(self):
         resp = self.post()
@@ -231,8 +402,17 @@ class PickupCreateSuccessTests(PickupCreateBase):
         self.assertEqual(self.post(reservation_id=second.pk).status_code, 201)
         self.assertEqual(Pickup.objects.count(), 2)
 
+    def test_blank_instructions_stored_as_null(self):
+        for blank in ("", "   "):
+            with self.subTest(value=blank):
+                res = make_reservation(self.provider, self.receiver, deadline=self.deadline)
+                resp = self.post(self.payload(instructions=blank), reservation_id=res.pk)
+                self.assertEqual(resp.status_code, 201, resp.content)
+                self.assertIsNone(resp.json()["data"]["instructions"])
+                self.assertIsNone(Pickup.objects.get(reservation=res).instructions)
 
-# ---------------------------------------------------------------- authn / authz / CSRF
+
+# ---------------------------------------------------------------- Create: authn / authz / CSRF
 class PickupCreateAccessTests(PickupCreateBase):
     def test_unauthenticated_401(self):
         resp = self.post(client=APIClient())
@@ -241,7 +421,7 @@ class PickupCreateAccessTests(PickupCreateBase):
 
     def test_inactive_account_401(self):
         self.provider.is_active = False
-        self.provider.save()  # session dibuat di setUp, akun dinonaktifkan sesudahnya
+        self.provider.save()  # the session is created in setUp; the account is deactivated afterwards
         resp = self.post()
         self.assertError(resp, 401, "authentication_required")
         self.assertNoPickup()
@@ -256,12 +436,9 @@ class PickupCreateAccessTests(PickupCreateBase):
     def test_valid_csrf_token_accepted(self):
         client = APIClient(enforce_csrf_checks=True)
         client.force_login(self.provider)
-        # GET /auth/csrf/ belum diimplementasi (issue lain), jadi cookie + header dibuat manual.
-        secret = _get_new_csrf_string()
-        client.cookies[settings.CSRF_COOKIE_NAME] = secret
+        token = self.csrf_token_for(client)
         resp = client.post(
-            self.url(), self.payload(), format="json",
-            HTTP_X_CSRFTOKEN=_mask_cipher_secret(secret),
+            self.url(), self.payload(), format="json", HTTP_X_CSRFTOKEN=token,
         )
         self.assertEqual(resp.status_code, 201, resp.content)
 
@@ -289,7 +466,7 @@ class PickupCreateAccessTests(PickupCreateBase):
         self.assertIs(resp.json()["success"], False)
 
 
-# ---------------------------------------------------------------- 400 validation
+# ---------------------------------------------------------------- Create: 400 validation
 class PickupCreateValidationTests(PickupCreateBase):
     def test_missing_scheduled_at_400(self):
         resp = self.post(self.payload(scheduled_at=...))
@@ -337,7 +514,7 @@ class PickupCreateValidationTests(PickupCreateBase):
         self.assertNoPickup()
 
 
-# ---------------------------------------------------------------- 409 business rules
+# ---------------------------------------------------------------- Create: 409 business rules
 class PickupCreateConflictTests(PickupCreateBase):
     def test_reservation_not_accepted_409_invalid_transition(self):
         for status in ("PENDING", "REJECTED", "CANCELLED"):
@@ -355,7 +532,6 @@ class PickupCreateConflictTests(PickupCreateBase):
         self.assertEqual(Pickup.objects.count(), 1)
         original.refresh_from_db()
         self.assertEqual((original.scheduled_at, original.status, original.version), before)
-
 
     def test_terminal_pickup_also_blocks_a_new_one(self):
         for status in ("COMPLETED", "NO_SHOW", "CANCELLED"):
@@ -419,22 +595,22 @@ class PickupCreateConflictTests(PickupCreateBase):
         self.assertNoPickup()
 
     def test_deadline_uses_the_accepted_snapshot_not_the_live_source(self):
-        # Snapshot: deadline 2 hari lagi. Sumber live diubah ke deadline lebih dekat dari
-        # scheduled_at; hasil tidak boleh berubah karena snapshot bersifat beku.
+        # Snapshot: deadline is 2 days away. The live source is changed to a deadline earlier than
+        # scheduled_at; the result must not change because the snapshot is frozen.
         ResourceListing.objects.filter(pk=self.reservation.listing_id).update(
             available_until=timezone.now() + timedelta(minutes=5)
         )
         self.assertEqual(self.post().status_code, 201)
 
     def test_checks_precedence_state_before_contact(self):
-        # Reservation yang bukan ACCEPTED tetap melaporkan invalid_transition, meski kontak kosong.
+        # A reservation that is not ACCEPTED still reports invalid_transition, even if contacts are empty.
         pending = make_reservation(self.provider, self.receiver, status="PENDING")
         self.provider.whatsapp_number = ""
         self.provider.save()
         self.assertError(self.post(reservation_id=pending.pk), 409, "invalid_transition")
 
 
-# ---------------------------------------------------------------- snapshot location
+# ---------------------------------------------------------------- Create: snapshot location
 class PickupCreateLocationTests(PickupCreateBase):
     def test_location_copied_from_accepted_snapshot(self):
         resp = self.post()
@@ -455,14 +631,14 @@ class PickupCreateLocationTests(PickupCreateBase):
         self.assertNotEqual(resp.json()["data"]["location"], OTHER_LOCATION)
 
 
-# ---------------------------------------------------------------- DB-level guarantee
+# ---------------------------------------------------------------- Create: DB-level guarantee
 class PickupUniquePerReservationTests(PickupCreateBase):
     def test_database_rejects_second_pickup_for_same_reservation(self):
-        # OneToOneField harus menjaga keunikan walaupun pengecekan di API dilewati.
+        # The OneToOneField must enforce uniqueness even if the API-level check is bypassed.
         original = make_pickup(self.reservation)
 
-        # IntegrityError ditahan di dalam savepoint supaya transaksi tes Django
-        # tetap bisa dipakai setelah kegagalan database yang memang diharapkan.
+        # The IntegrityError is caught inside a savepoint so the Django test transaction
+        # remains usable after the expected database failure.
         with self.assertRaises(IntegrityError):
             with transaction.atomic():
                 Pickup.objects.create(
@@ -476,9 +652,10 @@ class PickupUniquePerReservationTests(PickupCreateBase):
         self.assertEqual(Pickup.objects.get(reservation=self.reservation).pk, original.pk)
 
 
-# ---------------------------------------------------------------- concurrency (PostgreSQL)
+# ---------------------------------------------------------------- Create: concurrency (PostgreSQL)
+@FAST_HASHER
 class PickupCreateConcurrencyTests(TransactionTestCase):
-    # Menguji request API yang berjalan bersamaan dengan koneksi DB yang terpisah.
+    # Tests concurrent API requests, each running on its own separate DB connection.
 
     reset_sequences = True
 
@@ -500,7 +677,7 @@ class PickupCreateConcurrencyTests(TransactionTestCase):
 
         def worker():
             try:
-                # Setiap worker punya koneksi DB thread-local dan client sendiri.
+                # Each worker has its own thread-local DB connection and its own client.
                 client = APIClient()
                 client.force_authenticate(user=self.provider)
                 barrier.wait(timeout=10)
@@ -550,3 +727,1253 @@ class PickupCreateConcurrencyTests(TransactionTestCase):
         self.assertEqual(statuses.count(201), 1, results)
         self.assertEqual(statuses.count(409), 4, results)
         self.assertEqual(Pickup.objects.filter(reservation=self.reservation).count(), 1)
+
+
+# ================================================================ List pickups
+# GET /api/v1/pickups/
+
+# ---------------------------------------------------------------- List: access
+class PickupListAccessTests(PickupReadUpdateBase):
+    def test_unauthenticated_401(self):
+        resp = APIClient().get(self.list_url())
+        self.assertError(resp, 401, "authentication_required")
+
+    def test_inactive_account_401(self):
+        client = self.client_for(self.provider)
+        self.provider.is_active = False
+        self.provider.save()
+        self.assertError(client.get(self.list_url()), 401, "authentication_required")
+
+
+# ---------------------------------------------------------------- List: visibility
+class PickupListVisibilityTests(PickupReadUpdateBase):
+    def test_provider_sees_own_pickup_with_contract_schema(self):
+        resp = self.get_list(self.provider)
+        self.assertEqual(resp.status_code, 200, resp.content)
+        body = resp.json()
+        self.assertIs(body["success"], True)
+        self.assertIsInstance(body["message"], str)
+
+        data = body["data"]
+        self.assertEqual(set(data), {"count", "next", "previous", "results"})
+        self.assertEqual(data["count"], 1)
+        self.assertIsNone(data["next"])
+        self.assertIsNone(data["previous"])
+        self.assertEqual(len(data["results"]), 1)
+        item = data["results"][0]
+        self.assertPickupSchema(item)
+        self.assertEqual(item["id"], self.pickup.pk)
+        self.assertEqual(item["reservation_id"], self.reservation.pk)
+        self.assertEqual(item["status"], "SCHEDULED")
+        self.assertEqual(item["location"], SNAPSHOT_LOCATION)
+
+    def test_receiver_sees_the_same_pickup(self):
+        resp = self.get_list(self.receiver)
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual([r["id"] for r in resp.json()["data"]["results"]], [self.pickup.pk])
+
+    def test_stranger_sees_empty_list(self):
+        resp = self.get_list(self.stranger)
+        self.assertEqual(resp.status_code, 200, resp.content)
+        data = resp.json()["data"]
+        self.assertEqual(data["count"], 0)
+        self.assertEqual(data["results"], [])
+        self.assertIsNone(data["next"])
+        self.assertIsNone(data["previous"])
+
+    def test_admin_non_participant_only_sees_own_pickups(self):
+        resp = self.get_list(self.admin)
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.json()["data"]["results"], [])
+
+    def test_other_users_pickups_are_excluded(self):
+        other_provider = make_user("other-provider")
+        other_receiver = make_user("other-receiver")
+        self.make_other_pickup(other_provider, other_receiver)
+        resp = self.get_list(self.provider)
+        ids = [r["id"] for r in resp.json()["data"]["results"]]
+        self.assertEqual(ids, [self.pickup.pk])
+
+    def test_terminal_history_stays_visible(self):
+        completed = self.make_other_pickup(status="COMPLETED")
+        no_show = self.make_other_pickup(status="NO_SHOW")
+        cancelled = self.make_other_pickup(status="CANCELLED")
+        resp = self.get_list(self.receiver)
+        ids = {r["id"] for r in resp.json()["data"]["results"]}
+        self.assertEqual(ids, {self.pickup.pk, completed.pk, no_show.pk, cancelled.pk})
+
+    def test_response_does_not_leak_contact(self):
+        resp = self.get_list(self.receiver)
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertNoContactLeak(resp)
+
+
+# ---------------------------------------------------------------- List: filters
+class PickupListFilterTests(PickupReadUpdateBase):
+    def test_filter_by_each_status(self):
+        expected = {
+            status: self.make_other_pickup(status=status).pk
+            for status in ("COMPLETED", "NO_SHOW", "CANCELLED")
+        }
+        expected["SCHEDULED"] = self.pickup.pk
+        for status, pk in expected.items():
+            with self.subTest(status=status):
+                resp = self.get_list(self.provider, status=status)
+                self.assertEqual(resp.status_code, 200, resp.content)
+                self.assertEqual([r["id"] for r in resp.json()["data"]["results"]], [pk])
+
+    def test_filter_by_role(self):
+        # self.provider is the provider in self.pickup and the receiver in the other pickup.
+        other = make_user("role-other")
+        as_receiver = self.make_other_pickup(provider=other, receiver=self.provider)
+
+        cases = (
+            ("provider", {self.pickup.pk}),
+            ("receiver", {as_receiver.pk}),
+        )
+        for role, expected in cases:
+            with self.subTest(role=role):
+                resp = self.get_list(self.provider, role=role)
+                self.assertEqual(resp.status_code, 200, resp.content)
+                self.assertEqual({r["id"] for r in resp.json()["data"]["results"]}, expected)
+
+        resp = self.get_list(self.provider)  # no role -> both
+        self.assertEqual(
+            {r["id"] for r in resp.json()["data"]["results"]}, {self.pickup.pk, as_receiver.pk}
+        )
+
+    def test_role_and_status_combined(self):
+        other = make_user("combo-other")
+        self.make_other_pickup(provider=other, receiver=self.provider, status="COMPLETED")
+        done = self.make_other_pickup(status="COMPLETED")
+        resp = self.get_list(self.provider, role="provider", status="COMPLETED")
+        self.assertEqual([r["id"] for r in resp.json()["data"]["results"]], [done.pk])
+
+    def test_invalid_filter_values_400(self):
+        for params, field in (
+            ({"status": "DONE"}, "status"),
+            ({"status": "scheduled"}, "status"),
+            ({"role": "admin"}, "role"),
+        ):
+            with self.subTest(params=params):
+                self.assertError(self.get_list(self.provider, **params), 400, field=field)
+
+    def test_unknown_query_param_400(self):
+        resp = self.get_list(self.provider, whatever="x")
+        self.assertError(resp, 400, "unknown_field", "whatever")
+
+
+# ---------------------------------------------------------------- List: pagination
+class PickupListPaginationTests(PickupReadUpdateBase):
+    def setUp(self):
+        super().setUp()
+        for i in range(1, 4):
+            self.make_other_pickup(when=self.scheduled + timedelta(hours=i))
+
+    def test_default_page_size_is_20(self):
+        for i in range(20):
+            self.make_other_pickup(when=self.scheduled + timedelta(days=1, minutes=i))
+        resp = self.get_list(self.provider)
+        data = resp.json()["data"]
+        self.assertEqual(data["count"], 24)
+        self.assertEqual(len(data["results"]), 20)
+        self.assertIsNotNone(data["next"])
+
+    def test_page_size_and_next_previous_links(self):
+        first = self.get_list(self.provider, page_size=2).json()["data"]
+        self.assertEqual(first["count"], 4)
+        self.assertEqual(len(first["results"]), 2)
+        self.assertIsNone(first["previous"])
+        self.assertIn("page=2", first["next"])
+        self.assertIn("page_size=2", first["next"])
+
+        second_response = self.get_list(self.provider, page=2, page_size=2)
+        self.assertEqual(second_response.status_code, 200, second_response.content)
+        second = second_response.json()["data"]
+        self.assertEqual(second["count"], 4)
+        self.assertEqual(len(second["results"]), 2)
+        self.assertIsNone(second["next"])
+        self.assertIsNotNone(second["previous"])
+
+        ids = [r["id"] for r in first["results"]] + [r["id"] for r in second["results"]]
+        self.assertEqual(len(set(ids)), 4, "pages must not overlap")
+
+    def test_page_size_boundaries_ok(self):
+        for size in (1, 100):
+            with self.subTest(page_size=size):
+                resp = self.get_list(self.provider, page_size=size)
+                self.assertEqual(resp.status_code, 200, resp.content)
+
+    def test_page_size_invalid_400(self):
+        for size in (0, 101, -1, "abc"):
+            with self.subTest(page_size=size):
+                self.assertError(self.get_list(self.provider, page_size=size), 400, field="page_size")
+
+    def test_page_out_of_range_404_page_not_found(self):
+        resp = self.get_list(self.provider, page=99)
+        self.assertError(resp, 404, "page_not_found")
+
+    def test_page_below_one_404_page_not_found(self):
+        for page in (0, -1):
+            with self.subTest(page=page):
+                self.assertError(self.get_list(self.provider, page=page), 404, "page_not_found")
+
+    def test_page_not_integer_400(self):
+        self.assertError(self.get_list(self.provider, page="abc"), 400, field="page")
+
+
+# ================================================================ Pickup detail
+# GET /api/v1/pickups/{id}/
+
+# ---------------------------------------------------------------- Detail: access, visibility, schema
+class PickupDetailTests(PickupReadUpdateBase):
+    def test_unauthenticated_401(self):
+        self.assertError(APIClient().get(self.detail_url()), 401, "authentication_required")
+
+    def test_inactive_account_401(self):
+        client = self.client_for(self.receiver)
+        self.receiver.is_active = False
+        self.receiver.save()
+        self.assertError(client.get(self.detail_url()), 401, "authentication_required")
+
+    def test_provider_receiver_and_admin_can_read_with_contract_schema(self):
+        for user in (self.provider, self.receiver, self.admin):
+            with self.subTest(user=user.email):
+                resp = self.get_detail(user)
+                self.assertEqual(resp.status_code, 200, resp.content)
+                body = resp.json()
+                self.assertIs(body["success"], True)
+                self.assertIsInstance(body["message"], str)
+                data = body["data"]
+                self.assertPickupSchema(data)
+                self.assertEqual(data["id"], self.pickup.pk)
+                self.assertEqual(data["reservation_id"], self.reservation.pk)
+                self.assertEqual(data["version"], 1)
+                self.assertEqual(data["status"], "SCHEDULED")
+                self.assertEqual(data["location"], SNAPSHOT_LOCATION)
+                self.assertEqual(parse_datetime(data["scheduled_at"]), self.pickup.scheduled_at)
+                for field in ("completed_at", "no_show_at", "cancelled_at"):
+                    self.assertIsNone(data[field])
+
+    def test_non_participant_gets_404_not_403(self):
+        resp = self.get_detail(self.stranger)
+        self.assertError(resp, 404, "not_found")
+
+    def test_pickup_not_found_404(self):
+        self.assertError(self.get_detail(self.provider, pk=999999), 404, "not_found")
+
+    def test_non_positive_id_400(self):
+        resp = self.get_detail(self.provider, pk=0)
+        self.assertEqual(resp.status_code, 400, resp.content)
+        self.assertIs(resp.json()["success"], False)
+
+    def test_terminal_pickup_remains_readable(self):
+        for status in ("COMPLETED", "NO_SHOW", "CANCELLED"):
+            with self.subTest(status=status):
+                pickup = self.make_other_pickup(status=status)
+                for user in (self.provider, self.receiver):
+                    resp = self.get_detail(user, pk=pickup.pk)
+                    self.assertEqual(resp.status_code, 200, resp.content)
+                    self.assertEqual(resp.json()["data"]["status"], status)
+
+    def test_response_does_not_leak_contact(self):
+        for user in (self.provider, self.receiver, self.admin):
+            with self.subTest(user=user.email):
+                resp = self.get_detail(user)
+                self.assertEqual(resp.status_code, 200, resp.content)
+                self.assertNoContactLeak(resp)
+
+
+# ================================================================ Update instructions
+# PATCH /api/v1/pickups/{id}/
+
+# ---------------------------------------------------------------- Update: authn / authz / CSRF
+class PickupPatchAccessTests(PickupReadUpdateBase):
+    def test_unauthenticated_401(self):
+        resp = self.patch(client=APIClient())
+        self.assertError(resp, 401, "authentication_required")
+        self.assertIsNone(self.snapshot_of(self.pickup)[1])
+
+    def test_inactive_account_401(self):
+        self.provider.is_active = False
+        self.provider.save()
+        self.assertError(self.patch(), 401, "authentication_required")
+
+    def test_missing_csrf_token_403_csrf_failed(self):
+        client = self.client_for(self.provider, enforce_csrf_checks=True)
+        resp = self.patch(client=client)
+        self.assertError(resp, 403, "csrf_failed")
+        self.assertIsNone(self.snapshot_of(self.pickup)[1])
+
+    def test_valid_csrf_token_accepted(self):
+        client = self.client_for(self.provider, enforce_csrf_checks=True)
+        token = self.csrf_token_for(client)
+        resp = client.patch(
+            self.detail_url(), {"instructions": "Dengan CSRF"}, format="json",
+            HTTP_X_CSRFTOKEN=token,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+
+    def test_receiver_is_participant_but_forbidden_403(self):
+        resp = self.patch(client=self.client_for(self.receiver))
+        self.assertError(resp, 403, "permission_denied")
+        self.assertIsNone(self.snapshot_of(self.pickup)[1])
+
+    def test_non_participant_gets_404_not_403(self):
+        resp = self.patch(client=self.client_for(self.stranger))
+        self.assertError(resp, 404, "not_found")
+        self.assertIsNone(self.snapshot_of(self.pickup)[1])
+
+    def test_pickup_not_found_404(self):
+        self.assertError(self.patch(pk=999999), 404, "not_found")
+
+    def test_non_positive_id_400(self):
+        resp = self.patch(pk=0)
+        self.assertEqual(resp.status_code, 400, resp.content)
+        self.assertIs(resp.json()["success"], False)
+
+    def test_permission_is_checked_before_validation(self):
+        bad = {"instructions": "x" * 2001}
+        self.assertError(self.patch(bad, client=self.client_for(self.receiver)), 403, "permission_denied")
+        self.assertError(self.patch(bad, client=self.client_for(self.stranger)), 404, "not_found")
+
+
+# ---------------------------------------------------------------- Update: success
+class PickupPatchSuccessTests(PickupReadUpdateBase):
+    def test_provider_updates_instructions_200_with_contract_schema(self):
+        before = self.snapshot_of(self.pickup)
+        resp = self.patch({"instructions": "Temui petugas di pintu utama"})
+        self.assertEqual(resp.status_code, 200, resp.content)
+        body = resp.json()
+        self.assertIs(body["success"], True)
+        self.assertIsInstance(body["message"], str)
+
+        data = body["data"]
+        self.assertPickupSchema(data)
+        self.assertEqual(data["id"], self.pickup.pk)
+        self.assertEqual(data["instructions"], "Temui petugas di pintu utama")
+        self.assertEqual(data["version"], before[0] + 1)
+        self.assertEqual(data["status"], "SCHEDULED")
+        self.assertEqual(data["reservation_id"], self.reservation.pk)
+        self.assertEqual(data["location"], SNAPSHOT_LOCATION)
+        self.assertEqual(parse_datetime(data["scheduled_at"]), self.scheduled)
+        for field in ("completed_at", "no_show_at", "cancelled_at"):
+            self.assertIsNone(data[field])
+
+        # persisted: only instructions, version, and updated_at change
+        after = self.snapshot_of(self.pickup)
+        self.assertEqual(after[1], "Temui petugas di pintu utama")  # instructions
+        self.assertEqual(after[0], before[0] + 1)                    # version
+        self.assertGreater(after[5], before[5])                      # updated_at
+        self.assertEqual(after[2:5], before[2:5])                    # scheduled_at, location, status
+
+    def test_admin_who_is_not_a_participant_can_patch(self):
+        resp = self.patch({"instructions": "Dari admin"}, client=self.client_for(self.admin))
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.json()["data"]["instructions"], "Dari admin")
+        self.assertEqual(self.snapshot_of(self.pickup)[1], "Dari admin")
+
+    def test_reservation_untouched(self):
+        before = Reservation.objects.get(pk=self.reservation.pk)
+        self.patch({"instructions": "Baru"})
+        after = Reservation.objects.get(pk=self.reservation.pk)
+        self.assertEqual(after.status, "ACCEPTED")
+        self.assertEqual(after.accepted_snapshot, before.accepted_snapshot)
+        self.assertEqual(after.resource_deadline, before.resource_deadline)
+        self.assertEqual(after.quantity, before.quantity)
+        self.assertEqual(Pickup.objects.count(), 1)
+
+    def test_instructions_can_be_set_to_null(self):
+        self.pickup.instructions = "Lama"
+        self.pickup.save()
+        resp = self.patch({"instructions": None})
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertIsNone(resp.json()["data"]["instructions"])
+        self.assertIsNone(self.snapshot_of(self.pickup)[1])
+
+    def test_instructions_exactly_2000_chars_ok(self):
+        resp = self.patch({"instructions": "x" * 2000})
+        self.assertEqual(resp.status_code, 200, resp.content)
+
+    def test_repeated_updates_increment_version_each_time(self):
+        for i in range(1, 4):
+            resp = self.patch({"instructions": f"Versi {i}"})
+            self.assertEqual(resp.json()["data"]["version"], 1 + i)
+
+    def test_noop_requests_change_nothing(self):
+        # No field, same value, and ""/whitespace over null: 200, nothing changes, version stays.
+        cases = (
+            ("Sama", {}),
+            ("Sama", {"instructions": "Sama"}),
+            (None, {"instructions": ""}),
+            (None, {"instructions": "   "}),
+        )
+        for current, body in cases:
+            with self.subTest(current=current, body=body):
+                Pickup.objects.filter(pk=self.pickup.pk).update(instructions=current)
+                before = self.snapshot_of(self.pickup)
+                resp = self.patch(body)
+                self.assertEqual(resp.status_code, 200, resp.content)
+                self.assertEqual(self.snapshot_of(self.pickup), before)
+
+    def test_response_does_not_leak_contact(self):
+        resp = self.patch({"instructions": "Baru"})
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertNoContactLeak(resp)
+
+    def test_blank_instructions_normalised_to_null(self):
+        for blank in ("", "   "):
+            with self.subTest(value=blank):
+                Pickup.objects.filter(pk=self.pickup.pk).update(instructions="Lama")
+                resp = self.patch({"instructions": blank})
+                self.assertEqual(resp.status_code, 200, resp.content)
+                self.assertIsNone(resp.json()["data"]["instructions"])
+                self.assertIsNone(self.snapshot_of(self.pickup)[1])
+
+
+# ---------------------------------------------------------------- Update: 400 validation
+class PickupPatchValidationTests(PickupReadUpdateBase):
+    def assertUnchanged(self):
+        self.assertEqual(self.snapshot_of(self.pickup)[:5], (
+            1, None, self.scheduled, SNAPSHOT_LOCATION, "SCHEDULED",
+        ))
+
+    def test_instructions_over_2000_chars_400(self):
+        resp = self.patch({"instructions": "x" * 2001})
+        self.assertError(resp, 400, field="instructions")
+        self.assertUnchanged()
+
+    def test_instructions_wrong_type_400(self):
+        for bad in (123, 1.5, True, ["a"], {"a": 1}):
+            with self.subTest(value=bad):
+                self.assertError(self.patch({"instructions": bad}), 400, field="instructions")
+        self.assertUnchanged()
+
+    def test_schedule_and_location_edits_rejected_400(self):
+        later = (self.scheduled + timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        for extra in (
+            {"scheduled_at": later},
+            {"location": OTHER_LOCATION},
+            {"scheduled_at": later, "location": OTHER_LOCATION, "instructions": "Baru"},
+        ):
+            with self.subTest(extra=extra):
+                resp = self.patch(extra)
+                self.assertError(resp, 400)
+                self.assertIn("unknown_field", [e["code"] for e in resp.json()["errors"]])
+        self.assertUnchanged()
+
+    def test_server_owned_and_unknown_fields_rejected_400(self):
+        for extra in (
+            {"status": "COMPLETED"},
+            {"id": 1},
+            {"reservation_id": 1},
+            {"version": 9},
+            {"created_at": "2026-01-01T00:00:00Z"},
+            {"updated_at": "2026-01-01T00:00:00Z"},
+            {"completed_at": "2026-01-01T00:00:00Z"},
+            {"no_show_at": "2026-01-01T00:00:00Z"},
+            {"cancelled_at": "2026-01-01T00:00:00Z"},
+            {"whatever": "x"},
+        ):
+            with self.subTest(extra=extra):
+                body = {"instructions": "Baru", **extra}
+                resp = self.patch(body)
+                self.assertError(resp, 400)
+                field = next(iter(extra))
+                self.assertIn(field, [e["field"] for e in resp.json()["errors"]])
+        self.assertUnchanged()
+
+
+# ---------------------------------------------------------------- Update: 409 state and deadline
+class PickupPatchConflictTests(PickupReadUpdateBase):
+    def test_terminal_pickup_409_invalid_transition(self):
+        for status in ("COMPLETED", "NO_SHOW", "CANCELLED"):
+            with self.subTest(status=status):
+                pickup = self.make_other_pickup(status=status)
+                before = self.snapshot_of(pickup)
+                resp = self.patch({"instructions": "Terlambat"}, pk=pickup.pk)
+                self.assertError(resp, 409, "invalid_transition")
+                self.assertEqual(self.snapshot_of(pickup), before)
+
+    def test_reservation_not_accepted_409_invalid_transition(self):
+        Reservation.objects.filter(pk=self.reservation.pk).update(status="CANCELLED")
+        before = self.snapshot_of(self.pickup)
+        resp = self.patch({"instructions": "Baru"})
+        self.assertError(resp, 409, "invalid_transition")
+        self.assertEqual(self.snapshot_of(self.pickup), before)
+
+    def test_resource_deadline_passed_409_deadline_passed(self):
+        Reservation.objects.filter(pk=self.reservation.pk).update(
+            resource_deadline=timezone.now() - timedelta(minutes=1)
+        )
+        before = self.snapshot_of(self.pickup)
+        resp = self.patch({"instructions": "Baru"})
+        self.assertError(resp, 409, "deadline_passed")
+        self.assertEqual(self.snapshot_of(self.pickup), before)
+
+    def test_admin_is_bound_by_the_same_state_rules(self):
+        admin_client = self.client_for(self.admin)
+        terminal = self.make_other_pickup(status="COMPLETED")
+        resp = self.patch({"instructions": "Admin"}, client=admin_client, pk=terminal.pk)
+        self.assertError(resp, 409, "invalid_transition")
+
+        Reservation.objects.filter(pk=self.reservation.pk).update(
+            resource_deadline=timezone.now() - timedelta(minutes=1)
+        )
+        resp = self.patch({"instructions": "Admin"}, client=admin_client)
+        self.assertError(resp, 409, "deadline_passed")
+
+
+# ---------------------------------------------------------------- Update: concurrency (PostgreSQL)
+@FAST_HASHER
+class PickupPatchConcurrencyTests(TransactionTestCase):
+    # Concurrent PATCH requests, each on its own separate DB connection.
+
+    reset_sequences = True
+
+    def setUp(self):
+        if connection.vendor != "postgresql":
+            self.skipTest("concurrency test requires PostgreSQL")
+
+        self.provider = make_user("patch-provider")
+        self.receiver = make_user("patch-receiver")
+        self.reservation = make_reservation(self.provider, self.receiver)
+        self.pickup = make_pickup(self.reservation)
+
+    def _race(self, n):
+        barrier = threading.Barrier(n)
+        results, errors = [], []
+        lock = threading.Lock()
+
+        def worker(index):
+            try:
+                client = APIClient()
+                client.force_authenticate(user=self.provider)
+                barrier.wait(timeout=10)
+                response = client.patch(
+                    f"/api/v1/pickups/{self.pickup.pk}/",
+                    {"instructions": f"instruksi-{index}"},
+                    format="json",
+                )
+                try:
+                    body = response.json()
+                except ValueError:
+                    body = {"raw_response": response.content.decode("utf-8", errors="replace")}
+                with lock:
+                    results.append((response.status_code, body))
+            except BaseException as exc:
+                with lock:
+                    errors.append(exc)
+            finally:
+                connections.close_all()
+
+        threads = [threading.Thread(target=worker, args=(i,), daemon=True) for i in range(n)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+
+        self.assertFalse(any(t.is_alive() for t in threads), "PATCH thread did not finish in 30s.")
+        self.assertEqual(errors, [], f"Exceptions in concurrent threads: {errors!r}")
+        self.assertEqual(len(results), n, f"Expected {n} responses, got {results!r}")
+        return results
+
+    def test_simultaneous_patches_are_serialized_without_lost_updates(self):
+        n = 5
+        results = self._race(n)
+        self.assertEqual([s for s, _ in results], [200] * n, results)
+
+        versions = sorted(body["data"]["version"] for _, body in results)
+        self.assertEqual(versions, list(range(2, n + 2)), "each PATCH must bump version exactly once")
+
+        self.pickup.refresh_from_db()
+        self.assertEqual(self.pickup.version, n + 1)
+        self.assertIn(self.pickup.instructions, {f"instruksi-{i}" for i in range(n)})
+        self.assertEqual(self.pickup.status, "SCHEDULED")
+        self.assertEqual(Pickup.objects.filter(reservation=self.reservation).count(), 1)
+
+
+# ================================================================ Complete pickup
+# POST /api/v1/pickups/{id}/complete/
+
+# ---------------------------------------------------------------- Complete: permission, validation, state, side effects
+class PickupCompleteTests(PickupActionBase):
+    def test_complete_rejects_non_accepted_reservation(self):
+        for status in (
+            ReservationStatus.PENDING,
+            ReservationStatus.CANCELLED,
+        ):
+            with self.subTest(reservation_status=status):
+                listing, reservation, pickup = self.listing_scenario()
+
+                Reservation.objects.filter(pk=reservation.pk).update(status=status)
+
+                response = self.post(self.receiver, "complete", pickup, {})
+                self.assert_error(response, 409, "invalid_transition")
+
+                pickup.refresh_from_db()
+                reservation.refresh_from_db()
+                listing.refresh_from_db()
+
+                self.assertEqual(pickup.status, "SCHEDULED")
+                self.assertEqual(reservation.status, status)
+                self.assertEqual(listing.status, ListingStatus.AVAILABLE)
+            
+    def test_complete_receiver_or_admin_and_keeps_reservation_accepted(self):
+        listing, reservation, pickup = self.listing_scenario()
+        self.assert_error(self.post(self.provider, "complete", pickup, {}), 403, "permission_denied")
+
+        response = self.post(self.receiver, "complete", pickup, {})
+        self.assertEqual(response.status_code, 200, response.content)
+        pickup.refresh_from_db()
+        reservation.refresh_from_db()
+        listing.refresh_from_db()
+        self.assertEqual(pickup.status, "COMPLETED")
+        self.assertEqual(reservation.status, ReservationStatus.ACCEPTED)
+        self.assertEqual(listing.status, ListingStatus.COMPLETED)
+
+        _, _, admin_pickup = self.listing_scenario()
+        response = self.post(self.admin, "complete", admin_pickup, {})
+        self.assertEqual(response.status_code, 200, response.content)
+
+    def test_complete_rejects_unauthenticated_and_unrelated_user(self):
+        _, _, pickup = self.listing_scenario()
+        anonymous = APIClient()
+        response = anonymous.post(
+            f"/api/v1/pickups/{pickup.pk}/complete/", {}, format="json"
+        )
+        self.assertEqual(response.status_code, 401, response.content)
+
+        stranger = make_user("action-complete-stranger")
+        response = self.post(stranger, "complete", pickup, {})
+        self.assert_error(response, 404, "not_found")
+        pickup.refresh_from_db()
+        self.assertEqual(pickup.status, "SCHEDULED")
+        
+    def test_complete_rejects_extra_body_and_deadline_boundary(self):
+        _, _, pickup = self.listing_scenario()
+        self.assert_error(
+            self.post(self.receiver, "complete", pickup, {"quantity": "5"}), 400, "unknown_field"
+        )
+        with mock.patch("pickups.views.timezone.now", return_value=self.deadline):
+            response = self.post(self.receiver, "complete", pickup, {})
+        self.assert_error(response, 409, "deadline_passed")
+
+    def test_completion_recalculates_partial_listing_and_request(self):
+        listing, _, pickup = self.listing_scenario(total="10.000")
+        response = self.post(self.receiver, "complete", pickup, {})
+        self.assertEqual(response.status_code, 200, response.content)
+        listing.refresh_from_db()
+        self.assertEqual(listing.status, ListingStatus.AVAILABLE)
+
+        request, _, pickup = self.request_scenario(quantity="5.000")
+        response = self.post(self.receiver, "complete", pickup, {})
+        self.assertEqual(response.status_code, 200, response.content)
+        request.refresh_from_db()
+        self.assertEqual(request.status, RequestStatus.FULFILLED)
+
+    def test_complete_rejects_terminal_pickup(self):
+        for status in ("COMPLETED", "NO_SHOW", "CANCELLED"):
+            with self.subTest(pickup_status=status):
+                _, reservation, pickup = self.listing_scenario()
+                Pickup.objects.filter(pk=pickup.pk).update(status=status)
+                before_reservation = reservation.status
+                response = self.post(self.receiver, "complete", pickup, {})
+                self.assert_error(response, 409, "invalid_transition")
+                pickup.refresh_from_db()
+                reservation.refresh_from_db()
+                self.assertEqual(pickup.status, status)
+                self.assertEqual(reservation.status, before_reservation)
+                
+    def test_terminal_action_cannot_be_repeated_and_failure_rolls_back(self):
+        listing, reservation, pickup = self.listing_scenario()
+        client = APIClient()
+        client.force_login(self.receiver)
+        client.raise_request_exception = False
+        with mock.patch("pickups.views._recalculate_source", side_effect=RuntimeError("rollback")):
+            response = client.post(f"/api/v1/pickups/{pickup.pk}/complete/", {}, format="json")
+        self.assertEqual(response.status_code, 500)
+        pickup.refresh_from_db()
+        reservation.refresh_from_db()
+        listing.refresh_from_db()
+        self.assertEqual((pickup.status, reservation.status, listing.status),
+                         ("SCHEDULED", ReservationStatus.ACCEPTED, ListingStatus.AVAILABLE))
+
+        response = self.post(self.receiver, "complete", pickup, {})
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assert_error(self.post(self.receiver, "complete", pickup, {}), 409, "invalid_transition")
+    
+    def test_complete_just_before_deadline_succeeds(self):
+        _, _, pickup = self.listing_scenario()
+        with mock.patch(
+            "pickups.views.timezone.now", return_value=self.deadline - timedelta(microseconds=1)
+        ):
+            response = self.post(self.receiver, "complete", pickup, {})
+        self.assertEqual(response.status_code, 200, response.content)
+        pickup.refresh_from_db()
+        self.assertEqual(pickup.status, "COMPLETED")
+    
+    def test_complete_updates_completed_quantity_without_cancelling_reservation(self):
+        listing, reservation, pickup = self.listing_scenario(total="10.000", quantity="2.000")
+        response = self.post(self.receiver, "complete", pickup, {})
+        self.assertEqual(response.status_code, 200, response.content)
+
+        reservation.refresh_from_db()
+        listing.refresh_from_db()
+        self.assertEqual(reservation.status, ReservationStatus.ACCEPTED)
+        self.assertEqual(str(reservation.quantity), "2.000")
+        totals = Reservation.objects.filter(
+            listing=listing, status=ReservationStatus.ACCEPTED
+        ).aggregate(
+            allocated=Sum("quantity"),
+            completed=Sum("quantity", filter=Q(pickup__status="COMPLETED")),
+        )
+        self.assertEqual(str(totals["allocated"]), "2.000")
+        self.assertEqual(str(totals["completed"]), "2.000")
+        self.assertEqual(listing.status, ListingStatus.AVAILABLE)
+    
+    def test_complete_marks_request_fulfilled_and_counts_completed_quantity(self):
+        request, reservation, pickup = self.request_scenario(quantity="2.000")
+        response = self.post(self.receiver, "complete", pickup, {})
+        self.assertEqual(response.status_code, 200, response.content)
+
+        request.refresh_from_db()
+        reservation.refresh_from_db()
+        self.assertEqual(request.status, RequestStatus.FULFILLED)
+        self.assertEqual(reservation.status, ReservationStatus.ACCEPTED)
+        self.assertEqual(str(reservation.quantity), "2.000")
+        self.assertEqual(
+            Reservation.objects.filter(
+                request=request, status=ReservationStatus.ACCEPTED,
+                pickup__status="COMPLETED",
+            ).count(),
+            1,
+        )
+
+
+# ================================================================ No-show pickup
+# POST /api/v1/pickups/{id}/no-show/
+
+# ---------------------------------------------------------------- No-show: permission, validation, state, side effects
+class PickupNoShowTests(PickupActionBase):
+    def test_no_show_requires_provider_reason_and_cancels_reservation(self):
+        listing, reservation, pickup = self.listing_scenario(status=ListingStatus.RESERVED)
+        self.assert_error(self.post(self.receiver, "no-show", pickup, {"reason": "absent"}), 403,
+                          "permission_denied")
+        self.assert_error(self.post(self.provider, "no-show", pickup, {}), 400)
+
+        response = self.post(self.provider, "no-show", pickup, {"reason": "Tidak hadir"})
+        self.assertEqual(response.status_code, 200, response.content)
+        pickup.refresh_from_db()
+        reservation.refresh_from_db()
+        listing.refresh_from_db()
+        self.assertEqual(pickup.status, "NO_SHOW")
+        self.assertEqual(reservation.status, ReservationStatus.CANCELLED)
+        self.assertEqual(reservation.reason, "Tidak hadir")
+        self.assertEqual(listing.status, ListingStatus.AVAILABLE)
+        self.assert_error(
+            self.post(self.provider, "no-show", pickup, {"reason": "Tidak hadir"}),
+            409,
+            "invalid_transition",
+        )
+
+        _, _, admin_pickup = self.listing_scenario(status=ListingStatus.RESERVED)
+        response = self.post(self.admin, "no-show", admin_pickup, {"reason": "Tidak hadir"})
+        self.assertEqual(response.status_code, 200, response.content)
+
+    def test_no_show_rejects_blank_or_non_string_reason_without_side_effects(self):
+        for reason in ("", "   ", 123, True, [], {}):
+            with self.subTest(reason=reason):
+                listing, reservation, pickup = self.listing_scenario(status=ListingStatus.RESERVED)
+                response = self.post(self.provider, "no-show", pickup, {"reason": reason})
+                self.assertEqual(response.status_code, 400, response.content)
+                pickup.refresh_from_db()
+                reservation.refresh_from_db()
+                listing.refresh_from_db()
+                self.assertEqual(pickup.status, "SCHEDULED")
+                self.assertEqual(reservation.status, ReservationStatus.ACCEPTED)
+                self.assertEqual(listing.status, ListingStatus.RESERVED)
+    
+    def test_no_show_rejects_unauthenticated_and_unrelated_user(self):
+        _, _, pickup = self.listing_scenario(status=ListingStatus.RESERVED)
+        anonymous = APIClient()
+        response = anonymous.post(
+            f"/api/v1/pickups/{pickup.pk}/no-show/", {"reason": "Tidak hadir"}, format="json"
+        )
+        self.assertEqual(response.status_code, 401, response.content)
+
+        stranger = make_user("action-stranger")
+        response = self.post(stranger, "no-show", pickup, {"reason": "Tidak hadir"})
+        self.assert_error(response, 404, "not_found")
+        pickup.refresh_from_db()
+        self.assertEqual(pickup.status, "SCHEDULED")
+        
+    def test_no_show_reopens_request_but_preserves_closed_source(self):
+        request, _, pickup = self.request_scenario(status=RequestStatus.ALLOCATED)
+        response = self.post(self.provider, "no-show", pickup, {"reason": "Tidak hadir"})
+        self.assertEqual(response.status_code, 200, response.content)
+        request.refresh_from_db()
+        self.assertEqual(request.status, RequestStatus.OPEN)
+
+        listing, _, pickup = self.listing_scenario(status=ListingStatus.CLOSED)
+        response = self.post(self.provider, "no-show", pickup, {"reason": "Tidak hadir"})
+        self.assertEqual(response.status_code, 200, response.content)
+        listing.refresh_from_db()
+        self.assertEqual(listing.status, ListingStatus.CLOSED)
+
+        expired, _, pickup = self.request_scenario(status=RequestStatus.EXPIRED)
+        response = self.post(self.provider, "no-show", pickup, {"reason": "Tidak hadir"})
+        self.assertEqual(response.status_code, 200, response.content)
+        expired.refresh_from_db()
+        self.assertEqual(expired.status, RequestStatus.EXPIRED)
+
+    def test_no_show_requires_schedule_to_pass_but_precedes_deadline(self):
+        _, _, pickup = self.listing_scenario(scheduled_at=self.deadline - timedelta(hours=1))
+        with mock.patch("pickups.views.timezone.now", return_value=pickup.scheduled_at):
+            response = self.post(self.provider, "no-show", pickup, {"reason": "Tidak hadir"})
+        self.assert_error(response, 409, "pickup_time_not_passed")
+
+        _, _, due_pickup = self.listing_scenario()
+        with mock.patch("pickups.views.timezone.now", return_value=self.deadline):
+            response = self.post(self.provider, "no-show", due_pickup, {"reason": "Tidak hadir"})
+        self.assert_error(response, 409, "deadline_passed")
+
+    def test_no_show_failure_rolls_back_pickup_and_reservation(self):
+        listing, reservation, pickup = self.listing_scenario(status=ListingStatus.RESERVED)
+        client = APIClient()
+        client.force_login(self.provider)
+        client.raise_request_exception = False
+        with mock.patch("pickups.views._recalculate_source", side_effect=RuntimeError("rollback")):
+            response = client.post(
+                f"/api/v1/pickups/{pickup.pk}/no-show/",
+                {"reason": "Tidak hadir"},
+                format="json",
+            )
+        self.assertEqual(response.status_code, 500)
+        pickup.refresh_from_db()
+        reservation.refresh_from_db()
+        listing.refresh_from_db()
+        self.assertEqual((pickup.status, reservation.status, listing.status),
+                         ("SCHEDULED", ReservationStatus.ACCEPTED, ListingStatus.RESERVED))
+    
+    def test_no_show_just_after_scheduled_at_succeeds(self):
+        scheduled_at = timezone.now() - timedelta(seconds=1)
+        listing, reservation, pickup = self.listing_scenario(
+            status=ListingStatus.RESERVED,
+            scheduled_at=scheduled_at,
+        )
+
+        with mock.patch(
+            "pickups.views.timezone.now",
+            return_value=scheduled_at + timedelta(microseconds=1),
+        ):
+            response = self.post(
+                self.provider, "no-show", pickup, {"reason": "Tidak hadir"}
+            )
+
+        self.assertEqual(response.status_code, 200, response.content)
+
+        pickup.refresh_from_db()
+        reservation.refresh_from_db()
+        listing.refresh_from_db()
+
+        self.assertEqual(pickup.status, "NO_SHOW")
+        self.assertEqual(reservation.status, ReservationStatus.CANCELLED)
+        self.assertEqual(listing.status, ListingStatus.AVAILABLE)
+
+
+# ================================================================ Complete vs no-show
+# Concurrent POST /complete/ and POST /no-show/ on the same pickup
+
+# ---------------------------------------------------------------- Complete vs no-show: concurrency (PostgreSQL)
+@FAST_HASHER
+class PickupActionConcurrencyTests(TransactionTestCase):
+    def setUp(self):
+        if connection.vendor != "postgresql":
+            self.skipTest("row-lock concurrency requires PostgreSQL")
+        self.provider = make_user("race-action-provider", whatsapp=PROVIDER_WA)
+        self.receiver = make_user("race-action-receiver", whatsapp=RECEIVER_WA)
+        self.reservation = make_reservation(self.provider, self.receiver)
+        self.pickup = make_pickup(self.reservation, timezone.now() - timedelta(hours=1))
+
+    def test_complete_and_no_show_race_has_one_winner(self):
+        barrier = threading.Barrier(2)
+        results = []
+
+        def post(user, action, body):
+            client = APIClient()
+            client.force_authenticate(user=user)
+            barrier.wait(timeout=10)
+            response = client.post(
+                f"/api/v1/pickups/{self.pickup.pk}/{action}/", body, format="json"
+            )
+            results.append(response.status_code)
+            connections.close_all()
+
+        threads = [
+            threading.Thread(target=post, args=(self.receiver, "complete", {})),
+            threading.Thread(target=post, args=(self.provider, "no-show", {"reason": "Tidak hadir"})),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertCountEqual(results, [200, 409])
+        
+    def _race_pickup_action_against_cancel(self, pickup_action, pickup_body, pickup_user):
+        """Race a pickup transition against the reservation cancellation endpoint."""
+        barrier = threading.Barrier(2)
+        results = []
+        errors = []
+        reservation_id = self.reservation.pk
+        pickup_id = self.pickup.pk
+
+        def post_pickup_action():
+            try:
+                client = APIClient()
+                client.force_authenticate(user=pickup_user)
+                barrier.wait(timeout=10)
+                response = client.post(
+                    f"/api/v1/pickups/{pickup_id}/{pickup_action}/",
+                    pickup_body,
+                    format="json",
+                )
+                results.append(("pickup", response.status_code))
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                connections.close_all()
+
+        def post_cancel():
+            try:
+                client = APIClient()
+                client.force_authenticate(user=self.receiver)
+                barrier.wait(timeout=10)
+                response = client.post(
+                    f"/api/v1/reservations/{reservation_id}/cancel/",
+                    {"reason": "Pembatalan bersamaan dengan aksi pickup"},
+                    format="json",
+                )
+                results.append(("cancel", response.status_code))
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                connections.close_all()
+
+        threads = [
+            threading.Thread(target=post_pickup_action),
+            threading.Thread(target=post_cancel),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+
+        self.assertFalse(any(thread.is_alive() for thread in threads), "race request did not finish")
+        self.assertEqual(errors, [], f"thread errors: {errors!r}")
+        self.assertCountEqual([status for _, status in results], [200, 409])
+        self.pickup.refresh_from_db()
+        self.reservation.refresh_from_db()
+
+        winner = next(action for action, status in results if status == 200)
+        if winner == "pickup":
+            if pickup_action == "complete":
+                self.assertEqual(self.pickup.status, "COMPLETED")
+                self.assertEqual(self.reservation.status, ReservationStatus.ACCEPTED)
+            else:
+                self.assertEqual(self.pickup.status, "NO_SHOW")
+                self.assertEqual(self.reservation.status, ReservationStatus.CANCELLED)
+                self.assertEqual(self.reservation.cancellation_code, "pickup_no_show")
+        else:
+            self.assertEqual(self.reservation.status, ReservationStatus.CANCELLED)
+            self.assertEqual(self.pickup.status, "CANCELLED")
+
+    def test_complete_and_reservation_cancel_race_has_one_winner(self):
+        self._race_pickup_action_against_cancel("complete", {}, self.receiver)
+
+    def test_no_show_and_reservation_cancel_race_has_one_winner(self):
+        self._race_pickup_action_against_cancel(
+            "no-show", {"reason": "Receiver tidak hadir"}, self.provider
+        )
+
+# ================================================================ Admin moderation
+@FAST_HASHER
+class AdminPickupContractTests(TestCase):
+    def setUp(self):
+        self.provider = make_user("admin-contract-provider", whatsapp=PROVIDER_WA)
+        self.receiver = make_user("admin-contract-receiver", whatsapp=RECEIVER_WA)
+        self.stranger = make_user("admin-contract-stranger")
+        self.admin = make_user("admin-contract-admin", is_admin=True)
+        self.deadline = (timezone.now() + timedelta(days=2)).replace(microsecond=0)
+        self.reservation = make_reservation(
+            self.provider, self.receiver, deadline=self.deadline,
+        )
+        self.scheduled = (timezone.now() + timedelta(days=1)).replace(microsecond=0)
+        self.client = APIClient()
+        self.client.force_login(self.admin)
+        self.base = "/api/v1/admin/"
+
+    def admin_post(self, path, body, *, client=None):
+        return (client or self.client).post(f"{self.base}{path}", body, format="json")
+
+    def admin_patch(self, pickup, body, *, client=None):
+        return (client or self.client).patch(
+            f"{self.base}pickups/{pickup.pk}/", body, format="json"
+        )
+
+    def admin_schedule(self, reservation=None, **overrides):
+        body = {
+            "scheduled_at": self.scheduled.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "instructions": "Temui petugas",
+            "reason": "Koreksi oleh moderator.",
+        }
+        body.update(overrides)
+        reservation = reservation or self.reservation
+        return self.admin_post(f"reservations/{reservation.pk}/pickup/", body)
+
+    def assert_error(self, response, status, code=None, field=None):
+        self.assertEqual(response.status_code, status, response.content)
+        payload = response.json()
+        self.assertFalse(payload["success"])
+        self.assertTrue(payload["errors"])
+        if code:
+            self.assertIn(code, [error["code"] for error in payload["errors"]])
+        if field:
+            self.assertIn(field, [error["field"] for error in payload["errors"]])
+
+    def test_admin_list_filters_all_statuses_reservation_and_paginates(self):
+        scheduled = make_pickup(self.reservation, self.scheduled, "SCHEDULED")
+        statuses = {"COMPLETED", "NO_SHOW", "CANCELLED"}
+        other_pickups = []
+        for i, status in enumerate(sorted(statuses), start=1):
+            other_reservation = make_reservation(
+                self.provider, self.receiver, deadline=self.deadline,
+            )
+            other_pickups.append(
+                make_pickup(other_reservation, self.scheduled + timedelta(minutes=i), status)
+            )
+
+        response = self.client.get(f"{self.base}pickups/", {"page": 1, "page_size": 2})
+        self.assertEqual(response.status_code, 200, response.content)
+        data = response.json()["data"]
+        self.assertEqual(data["count"], 4)
+        self.assertEqual(len(data["results"]), 2)
+        self.assertIsNotNone(data["next"])
+
+        for status in ("SCHEDULED", "COMPLETED", "NO_SHOW", "CANCELLED"):
+            response = self.client.get(f"{self.base}pickups/", {"status": status})
+            self.assertEqual(response.status_code, 200, response.content)
+            self.assertTrue(all(row["status"] == status for row in response.json()["data"]["results"]))
+
+        response = self.client.get(f"{self.base}pickups/", {"reservation_id": self.reservation.pk})
+        self.assertEqual([row["id"] for row in response.json()["data"]["results"]], [scheduled.pk])
+
+        non_admin = APIClient()
+        non_admin.force_login(self.stranger)
+        self.assert_error(non_admin.get(f"{self.base}pickups/"), 403, "permission_denied")
+
+    def test_admin_list_pagination_boundaries_and_write_permissions(self):
+        invalid_page = self.client.get(f"{self.base}pickups/", {"page": 0})
+        self.assert_error(invalid_page, 404, "page_not_found")
+        invalid_size = self.client.get(f"{self.base}pickups/", {"page_size": 101})
+        self.assert_error(invalid_size, 400, field="page_size")
+
+        non_admin = APIClient()
+        non_admin.force_login(self.stranger)
+        self.assert_error(
+            non_admin.post(
+                f"{self.base}reservations/{self.reservation.pk}/pickup/",
+                {"scheduled_at": self.scheduled.isoformat(), "reason": "Nope."}, format="json",
+            ),
+            403, "permission_denied",
+        )
+        pickup = make_pickup(self.reservation, self.scheduled)
+        self.assert_error(
+            non_admin.post(f"{self.base}pickups/{pickup.pk}/complete/", {"reason": "Nope."}, format="json"),
+            403, "permission_denied",
+        )
+
+    def test_admin_detail_reads_terminal_pickup_and_requires_admin(self):
+        pickup = make_pickup(self.reservation, self.scheduled, "NO_SHOW")
+        response = self.client.get(f"{self.base}pickups/{pickup.pk}/")
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(response.json()["data"]["status"], "NO_SHOW")
+
+        non_admin = APIClient()
+        non_admin.force_login(self.stranger)
+        self.assert_error(non_admin.get(f"{self.base}pickups/{pickup.pk}/"), 403, "permission_denied")
+
+    def test_admin_schedule_snapshots_location_and_audits_reason(self):
+        # A later source edit must not replace the accepted agreement snapshot.
+        self.reservation.listing.location = OTHER_LOCATION
+        self.reservation.listing.save(update_fields=["location", "updated_at"])
+        response = self.admin_schedule()
+        self.assertEqual(response.status_code, 201, response.content)
+        pickup = Pickup.objects.get(reservation=self.reservation)
+        self.assertEqual(pickup.location, SNAPSHOT_LOCATION)
+        self.assertEqual(response.json()["data"]["status"], "SCHEDULED")
+        event = AuditEvent.objects.get(entity_type="Pickup", entity_id=str(pickup.pk))
+        self.assertEqual(event.actor, self.admin)
+        self.assertEqual(event.action, "admin_scheduled")
+        self.assertEqual(event.summary["reason"], "Koreksi oleh moderator.")
+        self.assertEqual(event.summary["after"]["location"], SNAPSHOT_LOCATION)
+
+    def test_admin_schedule_rejects_duplicate_contact_status_and_deadline(self):
+        self.assertEqual(self.admin_schedule().status_code, 201)
+        self.assert_error(self.admin_schedule(), 409, "pickup_exists")
+
+        no_contact_reservation = make_reservation(self.provider, self.receiver, deadline=self.deadline)
+        # missing receiver contact
+        self.receiver.whatsapp_number = None
+        self.receiver.save()
+        try:
+            self.assert_error(self.admin_schedule(no_contact_reservation), 409, "contact_required")
+        finally:
+            self.receiver.whatsapp_number = RECEIVER_WA
+            self.receiver.save()
+        # missing provider contact
+        self.provider.whatsapp_number = None
+        self.provider.save()
+        try:
+            self.assert_error(self.admin_schedule(no_contact_reservation), 409, "contact_required")
+        finally:
+            self.provider.whatsapp_number = PROVIDER_WA
+            self.provider.save()
+        
+        not_accepted = make_reservation(self.provider, self.receiver, status="PENDING", deadline=self.deadline)
+        self.assert_error(self.admin_schedule(not_accepted), 409, "invalid_transition")
+
+        due_reservation = make_reservation(self.provider, self.receiver, deadline=self.scheduled)
+        self.assert_error(self.admin_schedule(due_reservation), 409, "deadline_passed")
+
+    def test_admin_schedule_rejects_blank_reason_and_unknown_fields(self):
+        self.assert_error(self.admin_schedule(reason=""), 400, field="reason")
+        self.assert_error(self.admin_schedule(extra="not allowed"), 400, code="unknown_field")
+        self.assertEqual(Pickup.objects.count(), 0)
+
+    def test_admin_patch_only_changes_instructions_and_audits_reason(self):
+        pickup = make_pickup(self.reservation, self.scheduled)
+        before_schedule = pickup.scheduled_at
+        response = self.admin_patch(pickup, {
+            "instructions": "Pintu utama", "reason": "Koreksi moderator."
+        })
+        self.assertEqual(response.status_code, 200, response.content)
+        pickup.refresh_from_db()
+        self.assertEqual(pickup.instructions, "Pintu utama")
+        self.assertEqual(pickup.scheduled_at, before_schedule)
+        self.assertEqual(pickup.location, SNAPSHOT_LOCATION)
+        event = AuditEvent.objects.get(entity_type="Pickup", entity_id=str(pickup.pk))
+        self.assertEqual(event.action, "admin_instructions_updated")
+        self.assertEqual(event.summary["reason"], "Koreksi moderator.")
+
+        for forbidden in ({"scheduled_at": self.scheduled.isoformat()}, {"location": OTHER_LOCATION}):
+            response = self.admin_patch(pickup, {**forbidden, "reason": "Tidak boleh."})
+            self.assert_error(response, 400, code="unknown_field")
+
+    def test_admin_patch_requires_reason_and_rejects_terminal_pickup(self):
+        pickup = make_pickup(self.reservation, self.scheduled)
+        self.assert_error(self.admin_patch(pickup, {"instructions": "Update"}), 400, field="reason")
+        pickup.status = "COMPLETED"
+        pickup.save()
+        self.assert_error(
+            self.admin_patch(pickup, {"instructions": "Update", "reason": "Koreksi."}),
+            409, "invalid_transition",
+        )
+
+        pickup.status = "SCHEDULED"
+        pickup.save()
+        Reservation.objects.filter(pk=self.reservation.pk).update(
+            resource_deadline=timezone.now() - timedelta(seconds=1)
+        )
+        self.assert_error(
+            self.admin_patch(pickup, {"instructions": "Update", "reason": "Terlambat."}),
+            409, "deadline_passed",
+        )
+
+    def test_admin_complete_uses_same_invariants_and_audits(self):
+        pickup = make_pickup(self.reservation, self.scheduled)
+        response = self.admin_post(f"pickups/{pickup.pk}/complete/", {"reason": "Sudah diterima."})
+        self.assertEqual(response.status_code, 200, response.content)
+        pickup.refresh_from_db()
+        self.reservation.refresh_from_db()
+        self.assertEqual(pickup.status, "COMPLETED")
+        self.assertEqual(self.reservation.status, ReservationStatus.ACCEPTED)
+        self.assertEqual(AuditEvent.objects.get(entity_id=str(pickup.pk)).summary["reason"], "Sudah diterima.")
+        self.assert_error(
+            self.admin_post(f"pickups/{pickup.pk}/complete/", {"reason": "Ulang."}),
+            409, "invalid_transition",
+        )
+
+    def test_admin_complete_requires_reason_and_deadline_boundary(self):
+        pickup = make_pickup(self.reservation, self.scheduled)
+        self.assert_error(self.admin_post(f"pickups/{pickup.pk}/complete/", {}), 400, field="reason")
+        with mock.patch("pickups.views.timezone.now", return_value=self.deadline):
+            response = self.admin_post(f"pickups/{pickup.pk}/complete/", {"reason": "Terlambat."})
+        self.assert_error(response, 409, "deadline_passed")
+        pickup.refresh_from_db()
+        self.assertEqual(pickup.status, "SCHEDULED")
+
+    def test_admin_no_show_requires_time_boundary_cancels_once_and_audits(self):
+        scheduled_at = timezone.now() - timedelta(seconds=1)
+        pickup = make_pickup(self.reservation, scheduled_at)
+        response = self.admin_post(f"pickups/{pickup.pk}/no-show/", {"reason": "Receiver tidak hadir."})
+        self.assertEqual(response.status_code, 200, response.content)
+        pickup.refresh_from_db()
+        self.reservation.refresh_from_db()
+        self.assertEqual(pickup.status, "NO_SHOW")
+        self.assertEqual(self.reservation.status, ReservationStatus.CANCELLED)
+        self.assertEqual(self.reservation.cancellation_code, "pickup_no_show")
+        event = AuditEvent.objects.get(entity_id=str(pickup.pk))
+        self.assertEqual(event.action, "admin_no_show")
+        self.assertEqual(event.summary["reason"], "Receiver tidak hadir.")
+        self.assert_error(
+            self.admin_post(f"pickups/{pickup.pk}/no-show/", {"reason": "Ulang."}),
+            409, "invalid_transition",
+        )
+
+    def test_admin_no_show_requires_reason_and_strict_time_boundary(self):
+        pickup = make_pickup(self.reservation, self.scheduled)
+        self.assert_error(self.admin_post(f"pickups/{pickup.pk}/no-show/", {}), 400, field="reason")
+        with mock.patch("pickups.views.timezone.now", return_value=pickup.scheduled_at):
+            response = self.admin_post(f"pickups/{pickup.pk}/no-show/", {"reason": "Tidak hadir."})
+        self.assert_error(response, 409, "pickup_time_not_passed")
+        with mock.patch("pickups.views.timezone.now", return_value=self.deadline):
+            response = self.admin_post(f"pickups/{pickup.pk}/no-show/", {"reason": "Terlambat."})
+        self.assert_error(response, 409, "deadline_passed")
+        pickup.refresh_from_db()
+        self.assertEqual(pickup.status, "SCHEDULED")
+
+    def test_admin_schedule_reason_is_required_and_rejects_unknown_fields(self):
+        payload = {
+            "scheduled_at": self.scheduled.isoformat(),
+            "instructions": "Temui petugas di pintu utama",
+        }
+        response = self.client.post(
+            f"/api/v1/admin/reservations/{self.reservation.id}/pickup/",
+            payload,
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400, response.content)
+        self.assertTrue(
+            any(
+                error["field"] == "reason"
+                and error["code"] == "required"
+                for error in response.data["errors"]
+            )
+        )
+    
+    def test_admin_audit_failure_rolls_back_domain_change(self):
+        pickup = make_pickup(self.reservation, self.scheduled)
+        client = APIClient()
+        client.force_login(self.admin)
+        client.raise_request_exception = False
+        with mock.patch("pickups.views._record_admin_pickup_audit", side_effect=RuntimeError("rollback")):
+            response = client.post(
+                f"{self.base}pickups/{pickup.pk}/complete/",
+                {"reason": "Audit wajib."}, format="json",
+            )
+        self.assertEqual(response.status_code, 500, response.content)
+        pickup.refresh_from_db()
+        self.assertEqual(pickup.status, "SCHEDULED")
