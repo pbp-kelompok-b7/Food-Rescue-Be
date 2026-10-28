@@ -10,6 +10,7 @@ from common.responses import *
 from reservations.models import Reservation, ReservationStatus, SourceType
 from listings.models import ListingStatus, ResourceListing
 from requests_app.models import RequestStatus, ResourceRequest
+from shared.models import AuditEvent
 from .models import Pickup, PickupStatus
 from .serializers import *
 
@@ -76,7 +77,17 @@ def _lock_source_then_reservation(reservation_id):
         pk=reservation_id
     ).first()
     return reservation, source
-        
+
+def _record_admin_pickup_audit(*, actor, action, pickup, reason, before, after):
+    """Record moderator changes in the same transaction as the domain mutation."""
+    AuditEvent.objects.create(
+        actor=actor,
+        entity_type="Pickup",
+        entity_id=str(pickup.pk),
+        action=action,
+        summary={"reason": reason, "before": before, "after": after},
+    )
+     
 # POST /api/v1/reservations/<int:pk>/pickup/
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
@@ -334,41 +345,268 @@ def pickups_detail_no_show(request, pk):
 @api_view(['GET'])
 @permission_classes([IsAdminUser])
 def admin_pickups(request):
-    # TODO: implement this operation.
-    return failure('Endpoint belum diimplementasikan.', [{'field': None, 'code': 'not_implemented', 'message': 'Business logic pending.'}], status=501)
+    query = AdminPickupListQuerySerializer(data=request.query_params)
+    query.is_valid(raise_exception=True)
+    params = query.validated_data
+
+    queryset = Pickup.objects.select_related("reservation").all()
+    if "status" in params:
+        queryset = queryset.filter(status=params["status"])
+    if "reservation_id" in params:
+        queryset = queryset.filter(reservation_id=params["reservation_id"])
+    queryset = queryset.order_by("-scheduled_at", "-id")
+
+    paginator = PageNumberPagination()
+    paginator.page_size = params.get("page_size", 20)
+    try:
+        page = paginator.paginate_queryset(queryset, request)
+    except NotFound:
+        raise NotFound(ErrorDetail("Halaman tidak ditemukan.", code="page_not_found"))
+
+    return success(
+        {
+            "count": paginator.page.paginator.count,
+            "next": paginator.get_next_link(),
+            "previous": paginator.get_previous_link(),
+            "results": PickupSerializer(page, many=True).data,
+        },
+        "Daftar Pickup",
+        status=200,
+    )
 
 
 # GET, PATCH /api/v1/admin/pickups/<int:pk>/
 @api_view(['GET', 'PATCH'])
 @permission_classes([IsAdminUser])
 def admin_pickups_detail(request, pk):
+    if pk <= 0:
+        raise ValidationError(
+            {"id": [ErrorDetail("ID harus bilangan bulat positif.", code="invalid")]}
+        )
+ 
     if request.method == "GET":
-        # TODO: implement this operation.
-        return failure('Endpoint belum diimplementasikan.', [{'field': None, 'code': 'not_implemented', 'message': 'Business logic pending.'}], status=501)
+        pickup = Pickup.objects.select_related("reservation").filter(pk=pk).first()
+        if pickup is None:
+            raise NotFound()
+ 
+        return success(PickupSerializer(pickup).data, "Data berhasil diambil", status=200)
+ 
     if request.method == "PATCH":
-        # TODO: implement this operation.
-        return failure('Endpoint belum diimplementasikan.', [{'field': None, 'code': 'not_implemented', 'message': 'Business logic pending.'}], status=501)
+        with transaction.atomic():
+            reservation_id = Pickup.objects.filter(pk=pk).values_list("reservation_id", flat=True).first()
+            if reservation_id is None:
+                raise NotFound()
+            reservation = Reservation.objects.select_for_update(of=("self",)).filter(pk=reservation_id).first()
+            pickup = Pickup.objects.select_for_update(of=("self",)).filter(pk=pk).first()
+            if reservation is None or pickup is None:
+                raise NotFound()
+
+            serializer = AdminPickupUpdateSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            if pickup.status != PickupStatus.SCHEDULED or reservation.status != ReservationStatus.ACCEPTED:
+                raise BusinessConflict(
+                    "Pickup harus SCHEDULED dan reservation harus berstatus ACCEPTED.",
+                    code="invalid_transition",
+                )
+            now = timezone.now()
+            if now >= reservation.resource_deadline or pickup.scheduled_at >= reservation.resource_deadline:
+                raise BusinessConflict("Deadline resource telah terlewati.", code="deadline_passed")
+
+            data = serializer.validated_data
+            before = {"instructions": pickup.instructions, "status": pickup.status}
+            if "instructions" in data and data["instructions"] != pickup.instructions:
+                pickup.instructions = data["instructions"]
+                pickup.version += 1
+                pickup.updated_at = now
+                pickup.save(update_fields=["instructions", "version", "updated_at"])
+            _record_admin_pickup_audit(
+                actor=request.user,
+                action="admin_instructions_updated",
+                pickup=pickup,
+                reason=data["reason"],
+                before=before,
+                after={"instructions": pickup.instructions, "status": pickup.status},
+            )
+        
+        return success(PickupSerializer(pickup).data, "Instruksi pickup diperbarui", status=200)
 
 
-# POST /api/v1/admin/reservations/<int:pk>/pickup/
 @api_view(['POST'])
 @permission_classes([IsAdminUser])
 def admin_reservations_detail_pickup(request, pk):
-    # TODO: implement this operation.
-    return failure('Endpoint belum diimplementasikan.', [{'field': None, 'code': 'not_implemented', 'message': 'Business logic pending.'}], status=501)
+    if pk <= 0:
+        raise ValidationError(
+            {"id": [ErrorDetail("ID harus bilangan bulat positif.", code="invalid")]}
+        )
+
+    with transaction.atomic():
+        reservation = (
+            Reservation.objects.select_for_update(of=("self",))
+            .select_related("provider", "receiver")
+            .filter(pk=pk)
+            .first()
+        )
+        if reservation is None:
+            raise NotFound()
+
+        serializer = AdminPickupScheduleSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        scheduled_at = serializer.validated_data["scheduled_at"]
+
+        if reservation.status != ReservationStatus.ACCEPTED:
+            raise BusinessConflict("Reservation harus berstatus ACCEPTED.", code="invalid_transition")
+        if Pickup.objects.filter(reservation_id=reservation.pk).exists():
+            raise BusinessConflict("Reservation sudah memiliki pickup.", code="pickup_exists")
+        if not (reservation.provider.whatsapp_number and reservation.receiver.whatsapp_number):
+            raise BusinessConflict(
+                "Nomor WhatsApp provider dan receiver wajib diisi.", code="contact_required"
+            )
+        now = timezone.now()
+        if now >= reservation.resource_deadline or scheduled_at >= reservation.resource_deadline:
+            raise BusinessConflict(
+                {"scheduled_at": "Jadwal harus lebih awal dari deadline resource."},
+                code="deadline_passed",
+            )
+
+        location = (reservation.accepted_snapshot or {}).get("location")
+        if not location:
+            raise BusinessConflict(
+                "Snapshot kesepakatan tidak memiliki lokasi pickup.", code="invalid_transition"
+            )
+
+        try:
+            # Savepoint keeps the outer transaction usable if the UNIQUE reservation
+            # constraint wins a concurrent scheduling race.
+            with transaction.atomic():
+                pickup = Pickup.objects.create(
+                    reservation=reservation,
+                    scheduled_at=scheduled_at,
+                    location=dict(location),
+                    instructions=serializer.validated_data["instructions"],
+                )
+        except IntegrityError:
+            raise BusinessConflict("Reservation sudah memiliki pickup.", code="pickup_exists")
+
+        _record_admin_pickup_audit(
+            actor=request.user,
+            action="admin_scheduled",
+            pickup=pickup,
+            reason=serializer.validated_data["reason"],
+            before=None,
+            after={"status": pickup.status, "reservation_id": reservation.pk,
+                   "scheduled_at": pickup.scheduled_at.isoformat(), "location": pickup.location},
+        )
+
+    return success(PickupSerializer(pickup).data, "Pickup dijadwalkan oleh admin", status=201)
 
 
 # POST /api/v1/admin/pickups/<int:pk>/complete/
 @api_view(['POST'])
 @permission_classes([IsAdminUser])
 def admin_pickups_detail_complete(request, pk):
-    # TODO: implement this operation.
-    return failure('Endpoint belum diimplementasikan.', [{'field': None, 'code': 'not_implemented', 'message': 'Business logic pending.'}], status=501)
+    if pk <= 0:
+        raise ValidationError(
+            {"id": [ErrorDetail("ID harus bilangan bulat positif.", code="invalid")]}
+        )
+
+    with transaction.atomic():
+        reservation_id = Pickup.objects.filter(pk=pk).values_list("reservation_id", flat=True).first()
+        if reservation_id is None:
+            raise NotFound()
+        reservation, source = _lock_source_then_reservation(reservation_id)
+        pickup = Pickup.objects.select_for_update(of=("self",)).filter(pk=pk).first()
+        if reservation is None or pickup is None:
+            raise NotFound()
+
+        serializer = AdminPickupCompleteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        if pickup.status != PickupStatus.SCHEDULED or reservation.status != ReservationStatus.ACCEPTED:
+            raise BusinessConflict(
+                "Pickup harus SCHEDULED dan reservation harus berstatus ACCEPTED.",
+                code="invalid_transition",
+            )
+
+        now = timezone.now()
+        if now >= reservation.resource_deadline:
+            raise BusinessConflict("Deadline resource telah terlewati.", code="deadline_passed")
+
+        before = {"status": pickup.status, "reservation_status": reservation.status}
+        pickup.status = PickupStatus.COMPLETED
+        pickup.completed_at = now
+        pickup.version += 1
+        pickup.updated_at = now
+        pickup.save(update_fields=["status", "completed_at", "version", "updated_at"])
+        _recalculate_source(reservation, source, now)
+        _record_admin_pickup_audit(
+            actor=request.user,
+            action="admin_completed",
+            pickup=pickup,
+            reason=serializer.validated_data["reason"],
+            before=before,
+            after={"status": pickup.status, "reservation_status": reservation.status},
+        )
+
+    return success(PickupSerializer(pickup).data, "Pickup diselesaikan oleh admin", status=200)
 
 
 # POST /api/v1/admin/pickups/<int:pk>/no-show/
 @api_view(['POST'])
 @permission_classes([IsAdminUser])
 def admin_pickups_detail_no_show(request, pk):
-    # TODO: implement this operation.
-    return failure('Endpoint belum diimplementasikan.', [{'field': None, 'code': 'not_implemented', 'message': 'Business logic pending.'}], status=501)
+    if pk <= 0:
+        raise ValidationError(
+            {"id": [ErrorDetail("ID harus bilangan bulat positif.", code="invalid")]}
+        )
+
+    with transaction.atomic():
+        reservation_id = Pickup.objects.filter(pk=pk).values_list("reservation_id", flat=True).first()
+        if reservation_id is None:
+            raise NotFound()
+        reservation, source = _lock_source_then_reservation(reservation_id)
+        pickup = Pickup.objects.select_for_update(of=("self",)).filter(pk=pk).first()
+        if reservation is None or pickup is None:
+            raise NotFound()
+
+        serializer = AdminPickupNoShowSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        if pickup.status != PickupStatus.SCHEDULED or reservation.status != ReservationStatus.ACCEPTED:
+            raise BusinessConflict(
+                "Pickup harus SCHEDULED dan reservation harus berstatus ACCEPTED.",
+                code="invalid_transition",
+            )
+
+        now = timezone.now()
+        if now <= pickup.scheduled_at:
+            raise BusinessConflict(
+                "No-show hanya dapat dicatat setelah jadwal pickup terlewati.",
+                code="pickup_time_not_passed",
+            )
+        if now >= reservation.resource_deadline:
+            raise BusinessConflict("Deadline resource telah terlewati.", code="deadline_passed")
+
+        reason = serializer.validated_data["reason"]
+        before = {"pickup_status": pickup.status, "reservation_status": reservation.status}
+        pickup.status = PickupStatus.NO_SHOW
+        pickup.no_show_at = now
+        pickup.version += 1
+        pickup.updated_at = now
+        pickup.save(update_fields=["status", "no_show_at", "version", "updated_at"])
+
+        reservation.status = ReservationStatus.CANCELLED
+        reservation.reason = reason
+        reservation.cancellation_code = "pickup_no_show"
+        reservation.version += 1
+        reservation.updated_at = now
+        reservation.save(update_fields=["status", "reason", "cancellation_code", "version", "updated_at"])
+        _recalculate_source(reservation, source, now)
+        _record_admin_pickup_audit(
+            actor=request.user,
+            action="admin_no_show",
+            pickup=pickup,
+            reason=reason,
+            before=before,
+            after={"pickup_status": pickup.status, "reservation_status": reservation.status,
+                   "cancellation_code": reservation.cancellation_code},
+        )
+
+    return success(PickupSerializer(pickup).data, "Pickup ditandai no-show oleh admin", status=200)
