@@ -22,8 +22,9 @@ class ContractScaffoldTests(SimpleTestCase):
             self.assertEqual(response.status_code, 403)
 
 
-    def test_public_browse_reports_pending_not_fake_data(self):
-        self.assertEqual(self.client.get("/api/v1/listings/").status_code, 501)
+    def test_unimplemented_request_browse_reports_pending_not_fake_data(self):
+        # Supply Listing is implemented; Request Board is still a scaffold.
+        self.assertEqual(self.client.get("/api/v1/requests/").status_code, 501)
 
     def test_pagination_limits_and_validation_error_envelope(self):
         pagination = ContractPagination()
