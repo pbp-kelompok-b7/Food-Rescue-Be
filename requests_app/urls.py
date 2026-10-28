@@ -6,6 +6,6 @@ urlpatterns = [
     path("requests/<str:pk>/", views.requests_detail),
     path("requests/<str:pk>/close/", views.requests_detail_close),
     path("admin/requests/", views.admin_requests),
-    path("admin/requests/<str:pk>/", views.admin_requests_detail),
-    path("admin/requests/<str:pk>/close/", views.admin_requests_detail_close),
+    path("admin/requests/<int:pk>/", views.admin_requests_detail),
+    path("admin/requests/<int:pk>/close/", views.admin_requests_detail_close),
 ]
