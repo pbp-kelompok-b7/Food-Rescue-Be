@@ -3,15 +3,80 @@ from rest_framework.pagination import PageNumberPagination
 from rest_framework.permissions import IsAdminUser, IsAuthenticated
 from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError, ErrorDetail
 from django.db import IntegrityError, transaction
-from django.db.models import Q
+from django.db.models import Q, Sum
 from django.utils import timezone
 from common.exceptions import *
 from common.responses import *
-from reservations.models import Reservation, ReservationStatus
+from reservations.models import Reservation, ReservationStatus, SourceType
+from listings.models import ListingStatus, ResourceListing
+from requests_app.models import RequestStatus, ResourceRequest
 from .models import Pickup, PickupStatus
 from .serializers import *
 
 
+def _recalculate_source(reservation, source, now):
+    """Recalculate a source's lifecycle status from its accepted quantities."""
+    accepted = Reservation.objects.filter(status=ReservationStatus.ACCEPTED)
+    if reservation.source_type == SourceType.LISTING_CLAIM:
+        if source is None or source.status in (
+            ListingStatus.CLOSED, ListingStatus.EXPIRED, ListingStatus.COMPLETED
+        ):
+            return
+        totals = accepted.filter(listing_id=source.pk).aggregate(
+            allocated=Sum("quantity"),
+            completed=Sum("quantity", filter=Q(pickup__status=PickupStatus.COMPLETED)),
+        )
+        allocated = totals["allocated"] or 0
+        completed = totals["completed"] or 0
+        if completed >= source.quantity_total:
+            new_status = ListingStatus.COMPLETED
+        elif allocated >= source.quantity_total:
+            new_status = ListingStatus.RESERVED
+        else:
+            new_status = ListingStatus.AVAILABLE
+    else:
+        if source is None or source.status in (
+            RequestStatus.CLOSED, RequestStatus.EXPIRED, RequestStatus.FULFILLED
+        ):
+            return
+        totals = accepted.filter(request_id=source.pk).aggregate(
+            allocated=Sum("quantity"),
+            completed=Sum("quantity", filter=Q(pickup__status=PickupStatus.COMPLETED)),
+        )
+        allocated = totals["allocated"] or 0
+        completed = totals["completed"] or 0
+        if completed >= source.quantity_needed:
+            new_status = RequestStatus.FULFILLED
+        elif allocated >= source.quantity_needed:
+            new_status = RequestStatus.ALLOCATED
+        else:
+            new_status = RequestStatus.OPEN
+
+    if source.status != new_status:
+        source.status = new_status
+        source.version += 1
+        source.updated_at = now
+        source.save()
+
+def _lock_source_then_reservation(reservation_id):
+    ref = Reservation.objects.filter(pk=reservation_id).values(
+        "source_type", "listing_id", "request_id"
+    ).first()
+    if ref is None:
+        return None, None
+    if ref["source_type"] == SourceType.LISTING_CLAIM:
+        source = ResourceListing.objects.select_for_update(of=("self",)).filter(
+            pk=ref["listing_id"]
+        ).first()
+    else:
+        source = ResourceRequest.objects.select_for_update(of=("self",)).filter(
+            pk=ref["request_id"]
+        ).first()
+    reservation = Reservation.objects.select_for_update(of=("self",)).filter(
+        pk=reservation_id
+    ).first()
+    return reservation, source
+        
 # POST /api/v1/reservations/<int:pk>/pickup/
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
@@ -160,7 +225,7 @@ def pickups_detail(request, pk):
                 pickup.instructions = data["instructions"]
                 pickup.version += 1
                 pickup.updated_at = timezone.now()
-                pickup.save(update_fields=["instructions", "version", "updated_at"])
+                pickup.save()
         
         return success(PickupSerializer(pickup).data, "Instruksi pickup diperbarui", status=200)
 
@@ -168,16 +233,101 @@ def pickups_detail(request, pk):
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def pickups_detail_complete(request, pk):
-    # TODO: implement this operation.
-    return failure('Endpoint belum diimplementasikan.', [{'field': None, 'code': 'not_implemented', 'message': 'Business logic pending.'}], status=501)
+    if pk <= 0:
+        raise ValidationError(
+            {"id": [ErrorDetail("ID harus bilangan bulat positif.", code="invalid")]}
+        )
+
+    user = request.user
+    with transaction.atomic():
+        reservation_id = Pickup.objects.filter(pk=pk).values_list("reservation_id", flat=True).first()
+        if reservation_id is None:
+            raise NotFound()
+        reservation, source = _lock_source_then_reservation(reservation_id)
+        pickup = Pickup.objects.select_for_update(of=("self",)).filter(pk=pk).first()
+        if (
+            reservation is None
+            or pickup is None
+            or not (user.is_admin or user.pk in (reservation.provider_id, reservation.receiver_id))
+        ):
+            raise NotFound()
+        if not user.is_admin and user.pk != reservation.receiver_id:
+            raise PermissionDenied()
+        if pickup.status != PickupStatus.SCHEDULED or reservation.status != ReservationStatus.ACCEPTED:
+            raise BusinessConflict(
+                "Pickup harus SCHEDULED dan reservation harus berstatus ACCEPTED.", code="invalid_transition"
+        )
+            
+        serializer = PickupCompleteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        now = timezone.now()
+        if now >= reservation.resource_deadline:
+            raise BusinessConflict("Deadline resource telah terlewati.", code="deadline_passed")
+        
+        pickup.status = PickupStatus.COMPLETED
+        pickup.completed_at = now
+        pickup.version += 1
+        pickup.updated_at = now
+        pickup.save()
+        _recalculate_source(reservation, source, now)
+
+    return success(PickupSerializer(pickup).data, "Pickup diselesaikan", status=200)
 
 
 # POST /api/v1/pickups/<int:pk>/no-show/
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def pickups_detail_no_show(request, pk):
-    # TODO: implement this operation.
-    return failure('Endpoint belum diimplementasikan.', [{'field': None, 'code': 'not_implemented', 'message': 'Business logic pending.'}], status=501)
+    if pk <= 0:
+        raise ValidationError(
+            {"id": [ErrorDetail("ID harus bilangan bulat positif.", code="invalid")]}
+        )
+
+    user = request.user
+    with transaction.atomic():
+        reservation_id = Pickup.objects.filter(pk=pk).values_list("reservation_id", flat=True).first()
+        if reservation_id is None:
+            raise NotFound()
+        reservation, source = _lock_source_then_reservation(reservation_id)
+        pickup = Pickup.objects.select_for_update(of=("self",)).filter(pk=pk).first()
+        if (
+            reservation is None
+            or pickup is None
+            or not (user.is_admin or user.pk in (reservation.provider_id, reservation.receiver_id))
+        ):
+            raise NotFound()
+        if not user.is_admin and user.pk != reservation.provider_id:
+            raise PermissionDenied()
+
+        serializer = PickupNoShowSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        if pickup.status != PickupStatus.SCHEDULED or reservation.status != ReservationStatus.ACCEPTED:
+            raise BusinessConflict(
+                "Pickup harus SCHEDULED dan reservation harus berstatus ACCEPTED.", code="invalid_transition"
+            )
+
+        now = timezone.now()
+        if now <= pickup.scheduled_at:
+            raise BusinessConflict("No-show hanya dapat dicatat setelah jadwal pickup terlewati.", code="pickup_time_not_passed")
+        if now >= reservation.resource_deadline:
+            raise BusinessConflict("Deadline resource telah terlewati.", code="deadline_passed")
+
+        pickup.status = PickupStatus.NO_SHOW
+        pickup.no_show_at = now
+        pickup.version += 1
+        pickup.updated_at = now
+        pickup.save()
+        reservation.status = ReservationStatus.CANCELLED
+        reservation.reason = serializer.validated_data["reason"]
+        reservation.cancellation_code = "pickup_no_show"
+        reservation.version += 1
+        reservation.updated_at = now
+        reservation.save()
+        _recalculate_source(reservation, source, now)
+
+    return success(PickupSerializer(pickup).data, "Pickup ditandai no-show", status=200)
 
 
 # GET /api/v1/admin/pickups/

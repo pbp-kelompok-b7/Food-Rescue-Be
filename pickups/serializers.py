@@ -7,12 +7,7 @@ from .models import Pickup
 
 RFC3339 = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$")
 
-class PickupScheduleSerializer(serializers.Serializer):
-    scheduled_at = serializers.DateTimeField()
-    instructions = serializers.CharField(
-        max_length=2000, allow_null=True, allow_blank=True, required=False, default=None
-    )
-
+class StrictFieldsSerializer(serializers.Serializer):
     unknown_field_messages = {}
 
     def to_internal_value(self, data):
@@ -27,6 +22,12 @@ class PickupScheduleSerializer(serializers.Serializer):
                     for name in sorted(unknown)
                 })
         return super().to_internal_value(data)
+    
+class PickupScheduleSerializer(StrictFieldsSerializer):
+    scheduled_at = serializers.DateTimeField()
+    instructions = serializers.CharField(
+        max_length=2000, allow_null=True, allow_blank=True, required=False, default=None
+    )
 
     def validate_scheduled_at(self, value):
         raw = self.initial_data.get("scheduled_at")
@@ -64,21 +65,13 @@ class PickupSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = fields
         
-class PickupListQuerySerializer(serializers.Serializer):
+class PickupListQuerySerializer(StrictFieldsSerializer):
     status = serializers.ChoiceField(
         choices=["SCHEDULED", "COMPLETED", "NO_SHOW", "CANCELLED"], required=False
     )
     role = serializers.ChoiceField(choices=["provider", "receiver"], required=False)
     page = serializers.IntegerField(required=False)
     page_size = serializers.IntegerField(min_value=1, max_value=100, required=False)
- 
-    def to_internal_value(self, data):
-        unknown = set(data) - set(self.fields)
-        if unknown:
-            raise serializers.ValidationError(
-                {name: [ErrorDetail("Field tidak dikenal.", code="unknown_field")] for name in sorted(unknown)}
-            )
-        return super().to_internal_value(data)
     
 class PickupUpdateSerializer(PickupScheduleSerializer):
     scheduled_at = None
@@ -93,3 +86,16 @@ class PickupUpdateSerializer(PickupScheduleSerializer):
             "dan ajukan reservation baru untuk lokasi yang berbeda."
         ),
     }
+
+class PickupCompleteSerializer(StrictFieldsSerializer):
+    pass
+
+class PickupNoShowSerializer(StrictFieldsSerializer):
+    reason = serializers.CharField(
+        min_length=1, max_length=1000)
+    
+    def validate_reason(self, value):
+        raw = self.initial_data.get("reason")
+        if not isinstance(raw, str):
+            raise serializers.ValidationError("Harus berupa string.", code="invalid")
+        return value
