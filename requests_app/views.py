@@ -4,6 +4,7 @@ from django.db import transaction
 from django.db.models import DecimalField, Exists, F, OuterRef, Q, Subquery, Sum, Value
 from django.db.models.functions import Coalesce
 from django.utils import timezone
+from django.views.decorators.cache import never_cache
 from rest_framework.decorators import api_view, parser_classes, permission_classes
 from rest_framework.parsers import JSONParser
 from rest_framework.exceptions import NotAuthenticated, NotFound, PermissionDenied, ValidationError
@@ -269,6 +270,7 @@ def delete_request(request, pk):
 
 
 # GET, POST /api/v1/requests/
+@never_cache
 @api_view(['GET', 'POST'])
 @permission_classes([IsAuthenticatedOrReadOnly])
 @parser_classes([JSONParser])
@@ -280,6 +282,7 @@ def requests(request):
 
 
 # GET, PATCH, DELETE /api/v1/requests/<int:pk>/
+@never_cache
 @api_view(['GET', 'PATCH', 'DELETE'])
 @permission_classes([IsAuthenticatedOrReadOnly])
 @parser_classes([JSONParser])
@@ -293,6 +296,7 @@ def requests_detail(request, pk):
 
 
 # POST /api/v1/requests/<int:pk>/close/
+@never_cache
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 @parser_classes([JSONParser])

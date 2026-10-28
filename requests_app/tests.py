@@ -3,6 +3,7 @@ from copy import deepcopy
 from datetime import timedelta
 from decimal import Decimal
 from threading import Barrier, Event
+from unittest import skipUnless
 from unittest.mock import patch
 import json
 import time
@@ -14,7 +15,9 @@ from django.utils import timezone
 from rest_framework.test import APIClient
 
 from pickups.models import Pickup, PickupStatus
+from pickups import serializers as pickup_serializers
 from reservations.models import Reservation, ReservationStatus, SourceType
+from reservations import serializers as reservation_serializers
 from shared.enums import Mode, ResourceType, Suitability
 from shared.models import AuditEvent
 from .models import ResourceRequest, RequestStatus
@@ -196,6 +199,17 @@ class RequestReadTests(TestCase):
         self.client.force_authenticate(self.stranger)
         self.assertEqual(self.client.get(self.url, {"scope": "mine"}).status_code, 401)
 
+    def test_session_history_and_private_detail_are_never_cached(self):
+        source = self.make_request(status=RequestStatus.CLOSED, archived_at=self.now)
+        self.client.force_login(self.owner)
+        for response in (self.client.get(self.url, {"scope": "mine"}), self.detail(source)):
+            self.assertEqual(response.status_code, 200)
+            self.assertIn("no-store", response.get("Cache-Control", ""))
+        self.client.logout()
+        for response in (self.client.get(self.url, {"scope": "mine"}), self.detail(source)):
+            self.assertIn(response.status_code, (401, 404))
+            self.assertIn("no-store", response.get("Cache-Control", ""))
+
     def test_mine_includes_all_own_statuses_and_archive_but_no_other_users(self):
         own = [self.make_request(status=status, valid_until=self.now - timedelta(days=1), archived_at=self.now)
                for status in RequestStatus.values]
@@ -323,6 +337,7 @@ class RequestWriteTests(TestCase):
     def test_create_sets_session_owner_defaults_and_quantity_response(self):
         response = self.post(self.body)
         self.assertEqual(response.status_code, 201, response.data)
+        self.assertIn("no-store", response.get("Cache-Control", ""))
         data = response.data["data"]
         row = ResourceRequest.objects.get(pk=data["id"])
         self.assertEqual((row.owner_id, row.created_by_id), (self.owner.pk, self.owner.pk))
@@ -644,6 +659,16 @@ class RequestLifecycleTests(TestCase):
     def delete(self, source, data=None):
         return self.client.delete(f"/api/v1/requests/{source.pk}/", data, format="json")
 
+    def test_close_and_delete_responses_are_never_cached(self):
+        source = self.make_request()
+        response = self.close(source)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("no-store", response.get("Cache-Control", ""))
+        response = self.delete(source)
+        self.assertEqual(response.status_code, 204)
+        self.assertEqual(response.content, b"")
+        self.assertIn("no-store", response.get("Cache-Control", ""))
+
     def test_close_cancels_only_pending_and_preserves_every_accepted_field_and_pickup(self):
         source = self.make_request()
         pending = self.offer(source, "3", status=ReservationStatus.PENDING)
@@ -919,3 +944,258 @@ class RequestLifecycleConcurrencyTests(TransactionTestCase):
             self.assertEqual([f.result(timeout=15) for f in futures], [204, 204])
         self.assertEqual(AuditEvent.objects.filter(entity_type="ResourceRequest", action="archive").count(), 1)
         self.assertEqual(Reservation.objects.filter(request=self.source).count(), 1)
+
+
+@skipUnless(hasattr(reservation_serializers, "ReservationAcceptSerializer"),
+            "Requires the Match/Reservation implementation from PR #28.")
+class RequestReservationIntegrationTests(TestCase):
+    """Exercise real MR endpoints when that dependency is installed, never mocks."""
+
+    make_request = RequestReadTests.make_request
+
+    @classmethod
+    def setUpTestData(cls):
+        RequestReadTests.setUpTestData.__func__(cls)
+        cls.provider.whatsapp_number = "+6281234567891"
+        cls.provider.save(update_fields=["whatsapp_number"])
+
+    def setUp(self):
+        self.now = timezone.now()
+        self.client = APIClient()
+        self.source = self.make_request(donate_only=False, max_unit_price="100.00")
+
+    def submit_offer(self, quantity="5.000", mode="SELL", unit_price="80.00"):
+        self.client.force_authenticate(self.provider)
+        response = self.client.post(f"/api/v1/requests/{self.source.pk}/offers/", {
+            "resource_type": self.source.resource_type, "title": "Makanan siap ambil",
+            "category": self.source.category, "description": "Makanan untuk kegiatan kampus",
+            "quantity": quantity, "unit": self.source.unit, "mode": mode, "unit_price": unit_price,
+            "condition": "Layak konsumsi", "suitability": [self.source.intended_use],
+            "location": self.source.location,
+            "resource_deadline": (self.now + timedelta(days=2)).isoformat(),
+        }, format="json")
+        self.assertEqual(response.status_code, 201, response.data)
+        return Reservation.objects.get(pk=response.data["data"]["id"])
+
+    def accept(self, reservation):
+        self.client.force_authenticate(self.owner)
+        return self.client.post(f"/api/v1/reservations/{reservation.pk}/accept/",
+                                {"expected_version": reservation.version}, format="json")
+
+    def edit(self, body):
+        self.client.force_authenticate(self.owner)
+        return self.client.patch(f"/api/v1/requests/{self.source.pk}/", body, format="json")
+
+    def test_approval_rechecks_latest_donation_and_price_preferences(self):
+        for changes in ({"donate_only": True, "max_unit_price": None}, {"max_unit_price": "50.00"}):
+            with self.subTest(changes=changes):
+                self.source = self.make_request(donate_only=False, max_unit_price="100.00")
+                offer = self.submit_offer()
+                self.assertEqual(self.edit(changes).status_code, 200)
+                before = Reservation.objects.values().get(pk=offer.pk)
+                response = self.accept(offer)
+                self.assertEqual(response.status_code, 409, response.data)
+                self.assertEqual(response.data["errors"][0]["code"], "terms_mismatch")
+                self.assertEqual(Reservation.objects.values().get(pk=offer.pk), before)
+
+    def test_accepted_snapshot_stays_frozen_after_request_edit(self):
+        offer = self.submit_offer()
+        self.assertEqual(self.accept(offer).status_code, 200)
+        before = Reservation.objects.values().get(pk=offer.pk)
+        self.assertEqual(self.edit({"donate_only": True, "max_unit_price": None}).status_code, 200)
+        self.assertEqual(Reservation.objects.values().get(pk=offer.pk), before)
+        response = self.client.get(f"/api/v1/requests/{self.source.pk}/")
+        self.assertEqual(response.data["data"]["quantity_allocated"], "5.000")
+        self.assertEqual(response.data["data"]["quantity_remaining"], "15.000")
+
+    def test_floor_uses_real_accepted_offer_and_cancellation_releases_once(self):
+        offer = self.submit_offer(quantity="20.000")
+        self.assertEqual(self.accept(offer).status_code, 200)
+        response = self.edit({"quantity_needed": "19.000"})
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.data["errors"][0]["code"], "quantity_floor")
+        response = self.client.post(f"/api/v1/reservations/{offer.pk}/cancel/",
+                                    {"reason": "Tidak jadi"}, format="json")
+        self.assertEqual(response.status_code, 200, response.data)
+        response = self.client.get(f"/api/v1/requests/{self.source.pk}/")
+        self.assertEqual(response.data["data"]["status"], "OPEN")
+        self.assertEqual(response.data["data"]["quantity_remaining"], "20.000")
+        self.assertEqual(self.client.post(f"/api/v1/reservations/{offer.pk}/cancel/",
+                                         {"reason": "Ulang"}, format="json").status_code, 409)
+
+    def test_close_archive_and_expiry_block_actual_acceptance(self):
+        for action in ("close", "archive", "expiry"):
+            with self.subTest(action=action):
+                self.source = self.make_request(donate_only=False, max_unit_price="100.00")
+                offer = self.submit_offer()
+                self.client.force_authenticate(self.owner)
+                url = f"/api/v1/requests/{self.source.pk}/"
+                if action == "close":
+                    self.assertEqual(self.client.post(url + "close/", {"reason": "Selesai"}, format="json").status_code, 200)
+                elif action == "archive":
+                    self.assertEqual(self.client.delete(url).status_code, 204)
+                else:
+                    # Simulate elapsed time, not an implementation of the expiry worker.
+                    ResourceRequest.objects.filter(pk=self.source.pk).update(valid_until=self.now - timedelta(seconds=1))
+                offer.refresh_from_db()
+                before = Reservation.objects.values().get(pk=offer.pk)
+                response = self.accept(offer)
+                self.assertEqual(response.status_code, 409, response.data)
+                self.assertEqual(Reservation.objects.values().get(pk=offer.pk), before)
+
+    def test_accepted_cancellation_never_reopens_closed_or_archived_request(self):
+        for action in ("close", "archive"):
+            with self.subTest(action=action):
+                self.source = self.make_request(donate_only=False, max_unit_price="100.00")
+                accepted = self.submit_offer()
+                self.assertEqual(self.accept(accepted).status_code, 200)
+                pending = self.submit_offer()
+                self.client.force_authenticate(self.owner)
+                url = f"/api/v1/requests/{self.source.pk}/"
+                if action == "close":
+                    response = self.client.post(url + "close/", {"reason": "Stop"}, format="json")
+                    self.assertEqual(response.status_code, 200)
+                else:
+                    self.assertEqual(self.client.delete(url).status_code, 204)
+                pending.refresh_from_db()
+                self.assertEqual(pending.status, ReservationStatus.CANCELLED)
+                self.assertEqual(pending.cancellation_code, "SOURCE_CLOSED")
+                accepted.refresh_from_db()
+                self.assertEqual(accepted.status, ReservationStatus.ACCEPTED)
+                snapshot = deepcopy(accepted.accepted_snapshot)
+                response = self.client.post(f"/api/v1/reservations/{accepted.pk}/cancel/",
+                                            {"reason": "Tidak jadi"}, format="json")
+                self.assertEqual(response.status_code, 200, response.data)
+                self.source.refresh_from_db()
+                accepted.refresh_from_db()
+                self.assertEqual(self.source.status, RequestStatus.CLOSED)
+                self.assertEqual(accepted.accepted_snapshot, snapshot)
+                response = self.client.get(url)
+                self.assertEqual(response.data["data"]["quantity_allocated"], "0.000")
+                self.assertEqual(response.data["data"]["quantity_remaining"], "20.000")
+
+    def schedule(self, offer):
+        self.client.force_authenticate(self.provider)
+        response = self.client.post(f"/api/v1/reservations/{offer.pk}/pickup/", {
+            "scheduled_at": (self.now + timedelta(hours=1)).isoformat(),
+        }, format="json")
+        self.assertEqual(response.status_code, 201, response.data)
+        return Pickup.objects.get(pk=response.data["data"]["id"])
+
+    @skipUnless(hasattr(pickup_serializers, "PickupCompleteSerializer"), "Requires pickup PR #34.")
+    def test_actual_pickup_completion_moves_allocation_to_fulfilled(self):
+        offer = self.submit_offer(quantity="20.000")
+        self.assertEqual(self.accept(offer).status_code, 200)
+        pickup = self.schedule(offer)
+        self.client.force_authenticate(self.owner)
+        response = self.client.post(f"/api/v1/pickups/{pickup.pk}/complete/", {}, format="json")
+        self.assertEqual(response.status_code, 200, response.data)
+        data = self.client.get(f"/api/v1/requests/{self.source.pk}/").data["data"]
+        self.assertEqual(data["status"], "FULFILLED")
+        self.assertEqual(data["quantity_allocated"], "0.000")
+        self.assertEqual(data["quantity_fulfilled"], "20.000")
+        self.assertEqual(data["quantity_remaining"], "0.000")
+        self.assertEqual(self.client.get("/api/v1/requests/").data["data"]["count"], 0)
+
+    @skipUnless(hasattr(pickup_serializers, "PickupNoShowSerializer"), "Requires pickup PR #34.")
+    def test_actual_no_show_releases_allocation_and_allows_replacement_offer(self):
+        offer = self.submit_offer(quantity="20.000")
+        self.assertEqual(self.accept(offer).status_code, 200)
+        pickup = self.schedule(offer)
+        Pickup.objects.filter(pk=pickup.pk).update(scheduled_at=self.now - timedelta(hours=1))
+        response = self.client.post(f"/api/v1/pickups/{pickup.pk}/no-show/",
+                                    {"reason": "Penerima tidak hadir"}, format="json")
+        self.assertEqual(response.status_code, 200, response.data)
+        self.client.force_authenticate(self.owner)
+        data = self.client.get(f"/api/v1/requests/{self.source.pk}/").data["data"]
+        self.assertEqual((data["status"], data["quantity_remaining"]), ("OPEN", "20.000"))
+        replacement = self.submit_offer(quantity="20.000")
+        self.assertEqual(self.accept(replacement).status_code, 200)
+
+    @skipUnless(hasattr(pickup_serializers, "PickupCompleteSerializer"), "Requires pickup PR #34.")
+    def test_actual_pickup_after_close_or_archive_keeps_source_terminal(self):
+        for action in ("close", "archive"):
+            with self.subTest(action=action):
+                self.source = self.make_request(donate_only=False, max_unit_price="100.00")
+                offer = self.submit_offer(quantity="20.000")
+                self.assertEqual(self.accept(offer).status_code, 200)
+                self.client.force_authenticate(self.owner)
+                url = f"/api/v1/requests/{self.source.pk}/"
+                if action == "close":
+                    self.assertEqual(self.client.post(url + "close/", {"reason": "Stop"}, format="json").status_code, 200)
+                else:
+                    self.assertEqual(self.client.delete(url).status_code, 204)
+                pickup = self.schedule(offer)
+                self.client.force_authenticate(self.owner)
+                response = self.client.post(f"/api/v1/pickups/{pickup.pk}/complete/", {}, format="json")
+                self.assertEqual(response.status_code, 200, response.data)
+                data = self.client.get(url).data["data"]
+                self.assertEqual(data["status"], "CLOSED")
+                self.assertEqual(data["quantity_fulfilled"], "20.000")
+                self.assertEqual(data["quantity_allocated"], "0.000")
+
+
+@skipUnless(hasattr(reservation_serializers, "ReservationAcceptSerializer"),
+            "Requires the Match/Reservation implementation from PR #28.")
+@skipUnlessDBFeature("has_select_for_update")
+class RequestReservationConcurrencyTests(TransactionTestCase):
+    make_request = RequestReadTests.make_request
+
+    def setUp(self):
+        self.now = timezone.now()
+        users = get_user_model().objects
+        self.owner = users.create_user(email="owner@example.com", display_name="Owner")
+        self.provider = users.create_user(email="provider@example.com", display_name="Provider")
+        self.source = self.make_request(donate_only=False, max_unit_price="100.00")
+        self.client = APIClient()
+        self.offer = RequestReservationIntegrationTests.submit_offer(self, quantity="8.000")
+
+    def action(self, action, barrier):
+        close_old_connections()
+        try:
+            client = APIClient()
+            client.force_authenticate(self.owner)
+            barrier.wait(timeout=5)
+            url = f"/api/v1/requests/{self.source.pk}/"
+            if action == "accept":
+                response = client.post(f"/api/v1/reservations/{self.offer.pk}/accept/",
+                                       {"expected_version": self.offer.version}, format="json")
+            elif action == "edit":
+                response = client.patch(url, {"quantity_needed": "6.000"}, format="json")
+            else:
+                response = client.post(url + "close/", {"reason": "Stop"}, format="json")
+            return response.status_code
+        finally:
+            connection.close()
+
+    def test_actual_acceptance_and_quantity_edit_cannot_overallocate(self):
+        barrier = Barrier(2)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            accept = pool.submit(self.action, "accept", barrier)
+            edit = pool.submit(self.action, "edit", barrier)
+            self.assertEqual(sorted((accept.result(timeout=15), edit.result(timeout=15))), [200, 409])
+        self.source.refresh_from_db()
+        self.offer.refresh_from_db()
+        if self.offer.status == ReservationStatus.ACCEPTED:
+            self.assertEqual(self.source.quantity_needed, Decimal("20"))
+        else:
+            self.assertEqual(self.source.quantity_needed, Decimal("6"))
+            self.assertEqual(self.offer.status, ReservationStatus.PENDING)
+
+    def test_actual_acceptance_and_close_preserve_the_winning_transition(self):
+        barrier = Barrier(2)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            accept = pool.submit(self.action, "accept", barrier)
+            close = pool.submit(self.action, "close", barrier)
+            accepted_status, closed_status = accept.result(timeout=15), close.result(timeout=15)
+        self.assertEqual(closed_status, 200)
+        self.assertIn(accepted_status, (200, 409))
+        self.source.refresh_from_db()
+        self.offer.refresh_from_db()
+        self.assertEqual(self.source.status, RequestStatus.CLOSED)
+        if accepted_status == 200:
+            self.assertEqual(self.offer.status, ReservationStatus.ACCEPTED)
+            self.assertTrue(self.offer.accepted_snapshot)
+        else:
+            self.assertEqual(self.offer.status, ReservationStatus.CANCELLED)
+            self.assertEqual(self.offer.cancellation_code, "SOURCE_CLOSED")
