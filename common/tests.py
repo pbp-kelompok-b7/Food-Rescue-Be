@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from django.test import SimpleTestCase
+from django.test import SimpleTestCase, TestCase
 from rest_framework.test import APIClient
 from rest_framework.exceptions import ValidationError
 from common.pagination import ContractPagination
@@ -21,10 +21,6 @@ class ContractScaffoldTests(SimpleTestCase):
             response = self.client.post(f"/api/v1/auth/{operation}/", {}, format="json")
             self.assertEqual(response.status_code, 403)
 
-
-    def test_public_browse_reports_pending_not_fake_data(self):
-        self.assertEqual(self.client.get("/api/v1/listings/").status_code, 501)
-
     def test_pagination_limits_and_validation_error_envelope(self):
         pagination = ContractPagination()
         self.assertEqual(pagination.get_page_size(SimpleNamespace(query_params={})), 20)
@@ -36,3 +32,11 @@ class ContractScaffoldTests(SimpleTestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.data["errors"][0]["field"], "quantity")
 
+
+class PublicBrowseTests(TestCase):
+    def test_request_browse_returns_empty_results(self):
+        response = APIClient().get("/api/v1/requests/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.data["success"])
+        self.assertEqual(response.data["data"]["results"], [])
