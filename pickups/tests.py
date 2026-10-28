@@ -16,6 +16,7 @@ from reservations.models import Reservation, ReservationStatus, SourceType
 from requests_app.models import RequestStatus, ResourceRequest
 from pickups.models import Pickup
 from shared.enums import ResourceType, Mode, Unit
+from shared.models import AuditEvent
 
 FAST_HASHER = override_settings(
     PASSWORD_HASHERS=["django.contrib.auth.hashers.MD5PasswordHasher"]
@@ -1696,3 +1697,283 @@ class PickupActionConcurrencyTests(TransactionTestCase):
         self._race_pickup_action_against_cancel(
             "no-show", {"reason": "Receiver tidak hadir"}, self.provider
         )
+
+# ================================================================ Admin moderation
+@FAST_HASHER
+class AdminPickupContractTests(TestCase):
+    def setUp(self):
+        self.provider = make_user("admin-contract-provider", whatsapp=PROVIDER_WA)
+        self.receiver = make_user("admin-contract-receiver", whatsapp=RECEIVER_WA)
+        self.stranger = make_user("admin-contract-stranger")
+        self.admin = make_user("admin-contract-admin", is_admin=True)
+        self.deadline = (timezone.now() + timedelta(days=2)).replace(microsecond=0)
+        self.reservation = make_reservation(
+            self.provider, self.receiver, deadline=self.deadline,
+        )
+        self.scheduled = (timezone.now() + timedelta(days=1)).replace(microsecond=0)
+        self.client = APIClient()
+        self.client.force_login(self.admin)
+        self.base = "/api/v1/admin/"
+
+    def admin_post(self, path, body, *, client=None):
+        return (client or self.client).post(f"{self.base}{path}", body, format="json")
+
+    def admin_patch(self, pickup, body, *, client=None):
+        return (client or self.client).patch(
+            f"{self.base}pickups/{pickup.pk}/", body, format="json"
+        )
+
+    def admin_schedule(self, reservation=None, **overrides):
+        body = {
+            "scheduled_at": self.scheduled.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "instructions": "Temui petugas",
+            "reason": "Koreksi oleh moderator.",
+        }
+        body.update(overrides)
+        reservation = reservation or self.reservation
+        return self.admin_post(f"reservations/{reservation.pk}/pickup/", body)
+
+    def assert_error(self, response, status, code=None, field=None):
+        self.assertEqual(response.status_code, status, response.content)
+        payload = response.json()
+        self.assertFalse(payload["success"])
+        self.assertTrue(payload["errors"])
+        if code:
+            self.assertIn(code, [error["code"] for error in payload["errors"]])
+        if field:
+            self.assertIn(field, [error["field"] for error in payload["errors"]])
+
+    def test_admin_list_filters_all_statuses_reservation_and_paginates(self):
+        scheduled = make_pickup(self.reservation, self.scheduled, "SCHEDULED")
+        statuses = {"COMPLETED", "NO_SHOW", "CANCELLED"}
+        other_pickups = []
+        for i, status in enumerate(sorted(statuses), start=1):
+            other_reservation = make_reservation(
+                self.provider, self.receiver, deadline=self.deadline,
+            )
+            other_pickups.append(
+                make_pickup(other_reservation, self.scheduled + timedelta(minutes=i), status)
+            )
+
+        response = self.client.get(f"{self.base}pickups/", {"page": 1, "page_size": 2})
+        self.assertEqual(response.status_code, 200, response.content)
+        data = response.json()["data"]
+        self.assertEqual(data["count"], 4)
+        self.assertEqual(len(data["results"]), 2)
+        self.assertIsNotNone(data["next"])
+
+        for status in ("SCHEDULED", "COMPLETED", "NO_SHOW", "CANCELLED"):
+            response = self.client.get(f"{self.base}pickups/", {"status": status})
+            self.assertEqual(response.status_code, 200, response.content)
+            self.assertTrue(all(row["status"] == status for row in response.json()["data"]["results"]))
+
+        response = self.client.get(f"{self.base}pickups/", {"reservation_id": self.reservation.pk})
+        self.assertEqual([row["id"] for row in response.json()["data"]["results"]], [scheduled.pk])
+
+        non_admin = APIClient()
+        non_admin.force_login(self.stranger)
+        self.assert_error(non_admin.get(f"{self.base}pickups/"), 403, "permission_denied")
+
+    def test_admin_list_pagination_boundaries_and_write_permissions(self):
+        invalid_page = self.client.get(f"{self.base}pickups/", {"page": 0})
+        self.assert_error(invalid_page, 404, "page_not_found")
+        invalid_size = self.client.get(f"{self.base}pickups/", {"page_size": 101})
+        self.assert_error(invalid_size, 400, field="page_size")
+
+        non_admin = APIClient()
+        non_admin.force_login(self.stranger)
+        self.assert_error(
+            non_admin.post(
+                f"{self.base}reservations/{self.reservation.pk}/pickup/",
+                {"scheduled_at": self.scheduled.isoformat(), "reason": "Nope."}, format="json",
+            ),
+            403, "permission_denied",
+        )
+        pickup = make_pickup(self.reservation, self.scheduled)
+        self.assert_error(
+            non_admin.post(f"{self.base}pickups/{pickup.pk}/complete/", {"reason": "Nope."}, format="json"),
+            403, "permission_denied",
+        )
+
+    def test_admin_detail_reads_terminal_pickup_and_requires_admin(self):
+        pickup = make_pickup(self.reservation, self.scheduled, "NO_SHOW")
+        response = self.client.get(f"{self.base}pickups/{pickup.pk}/")
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(response.json()["data"]["status"], "NO_SHOW")
+
+        non_admin = APIClient()
+        non_admin.force_login(self.stranger)
+        self.assert_error(non_admin.get(f"{self.base}pickups/{pickup.pk}/"), 403, "permission_denied")
+
+    def test_admin_schedule_snapshots_location_and_audits_reason(self):
+        # A later source edit must not replace the accepted agreement snapshot.
+        self.reservation.listing.location = OTHER_LOCATION
+        self.reservation.listing.save(update_fields=["location", "updated_at"])
+        response = self.admin_schedule()
+        self.assertEqual(response.status_code, 201, response.content)
+        pickup = Pickup.objects.get(reservation=self.reservation)
+        self.assertEqual(pickup.location, SNAPSHOT_LOCATION)
+        self.assertEqual(response.json()["data"]["status"], "SCHEDULED")
+        event = AuditEvent.objects.get(entity_type="Pickup", entity_id=str(pickup.pk))
+        self.assertEqual(event.actor, self.admin)
+        self.assertEqual(event.action, "admin_scheduled")
+        self.assertEqual(event.summary["reason"], "Koreksi oleh moderator.")
+        self.assertEqual(event.summary["after"]["location"], SNAPSHOT_LOCATION)
+
+    def test_admin_schedule_rejects_duplicate_contact_status_and_deadline(self):
+        self.assertEqual(self.admin_schedule().status_code, 201)
+        self.assert_error(self.admin_schedule(), 409, "pickup_exists")
+
+        no_contact_reservation = make_reservation(self.provider, self.receiver, deadline=self.deadline)
+        # missing receiver contact
+        self.receiver.whatsapp_number = None
+        self.receiver.save()
+        try:
+            self.assert_error(self.admin_schedule(no_contact_reservation), 409, "contact_required")
+        finally:
+            self.receiver.whatsapp_number = RECEIVER_WA
+            self.receiver.save()
+        # missing provider contact
+        self.provider.whatsapp_number = None
+        self.provider.save()
+        try:
+            self.assert_error(self.admin_schedule(no_contact_reservation), 409, "contact_required")
+        finally:
+            self.provider.whatsapp_number = PROVIDER_WA
+            self.provider.save()
+        
+        not_accepted = make_reservation(self.provider, self.receiver, status="PENDING", deadline=self.deadline)
+        self.assert_error(self.admin_schedule(not_accepted), 409, "invalid_transition")
+
+        due_reservation = make_reservation(self.provider, self.receiver, deadline=self.scheduled)
+        self.assert_error(self.admin_schedule(due_reservation), 409, "deadline_passed")
+
+    def test_admin_schedule_rejects_blank_reason_and_unknown_fields(self):
+        self.assert_error(self.admin_schedule(reason=""), 400, field="reason")
+        self.assert_error(self.admin_schedule(extra="not allowed"), 400, code="unknown_field")
+        self.assertEqual(Pickup.objects.count(), 0)
+
+    def test_admin_patch_only_changes_instructions_and_audits_reason(self):
+        pickup = make_pickup(self.reservation, self.scheduled)
+        before_schedule = pickup.scheduled_at
+        response = self.admin_patch(pickup, {
+            "instructions": "Pintu utama", "reason": "Koreksi moderator."
+        })
+        self.assertEqual(response.status_code, 200, response.content)
+        pickup.refresh_from_db()
+        self.assertEqual(pickup.instructions, "Pintu utama")
+        self.assertEqual(pickup.scheduled_at, before_schedule)
+        self.assertEqual(pickup.location, SNAPSHOT_LOCATION)
+        event = AuditEvent.objects.get(entity_type="Pickup", entity_id=str(pickup.pk))
+        self.assertEqual(event.action, "admin_instructions_updated")
+        self.assertEqual(event.summary["reason"], "Koreksi moderator.")
+
+        for forbidden in ({"scheduled_at": self.scheduled.isoformat()}, {"location": OTHER_LOCATION}):
+            response = self.admin_patch(pickup, {**forbidden, "reason": "Tidak boleh."})
+            self.assert_error(response, 400, code="unknown_field")
+
+    def test_admin_patch_requires_reason_and_rejects_terminal_pickup(self):
+        pickup = make_pickup(self.reservation, self.scheduled)
+        self.assert_error(self.admin_patch(pickup, {"instructions": "Update"}), 400, field="reason")
+        pickup.status = "COMPLETED"
+        pickup.save()
+        self.assert_error(
+            self.admin_patch(pickup, {"instructions": "Update", "reason": "Koreksi."}),
+            409, "invalid_transition",
+        )
+
+        pickup.status = "SCHEDULED"
+        pickup.save()
+        Reservation.objects.filter(pk=self.reservation.pk).update(
+            resource_deadline=timezone.now() - timedelta(seconds=1)
+        )
+        self.assert_error(
+            self.admin_patch(pickup, {"instructions": "Update", "reason": "Terlambat."}),
+            409, "deadline_passed",
+        )
+
+    def test_admin_complete_uses_same_invariants_and_audits(self):
+        pickup = make_pickup(self.reservation, self.scheduled)
+        response = self.admin_post(f"pickups/{pickup.pk}/complete/", {"reason": "Sudah diterima."})
+        self.assertEqual(response.status_code, 200, response.content)
+        pickup.refresh_from_db()
+        self.reservation.refresh_from_db()
+        self.assertEqual(pickup.status, "COMPLETED")
+        self.assertEqual(self.reservation.status, ReservationStatus.ACCEPTED)
+        self.assertEqual(AuditEvent.objects.get(entity_id=str(pickup.pk)).summary["reason"], "Sudah diterima.")
+        self.assert_error(
+            self.admin_post(f"pickups/{pickup.pk}/complete/", {"reason": "Ulang."}),
+            409, "invalid_transition",
+        )
+
+    def test_admin_complete_requires_reason_and_deadline_boundary(self):
+        pickup = make_pickup(self.reservation, self.scheduled)
+        self.assert_error(self.admin_post(f"pickups/{pickup.pk}/complete/", {}), 400, field="reason")
+        with mock.patch("pickups.views.timezone.now", return_value=self.deadline):
+            response = self.admin_post(f"pickups/{pickup.pk}/complete/", {"reason": "Terlambat."})
+        self.assert_error(response, 409, "deadline_passed")
+        pickup.refresh_from_db()
+        self.assertEqual(pickup.status, "SCHEDULED")
+
+    def test_admin_no_show_requires_time_boundary_cancels_once_and_audits(self):
+        scheduled_at = timezone.now() - timedelta(seconds=1)
+        pickup = make_pickup(self.reservation, scheduled_at)
+        response = self.admin_post(f"pickups/{pickup.pk}/no-show/", {"reason": "Receiver tidak hadir."})
+        self.assertEqual(response.status_code, 200, response.content)
+        pickup.refresh_from_db()
+        self.reservation.refresh_from_db()
+        self.assertEqual(pickup.status, "NO_SHOW")
+        self.assertEqual(self.reservation.status, ReservationStatus.CANCELLED)
+        self.assertEqual(self.reservation.cancellation_code, "pickup_no_show")
+        event = AuditEvent.objects.get(entity_id=str(pickup.pk))
+        self.assertEqual(event.action, "admin_no_show")
+        self.assertEqual(event.summary["reason"], "Receiver tidak hadir.")
+        self.assert_error(
+            self.admin_post(f"pickups/{pickup.pk}/no-show/", {"reason": "Ulang."}),
+            409, "invalid_transition",
+        )
+
+    def test_admin_no_show_requires_reason_and_strict_time_boundary(self):
+        pickup = make_pickup(self.reservation, self.scheduled)
+        self.assert_error(self.admin_post(f"pickups/{pickup.pk}/no-show/", {}), 400, field="reason")
+        with mock.patch("pickups.views.timezone.now", return_value=pickup.scheduled_at):
+            response = self.admin_post(f"pickups/{pickup.pk}/no-show/", {"reason": "Tidak hadir."})
+        self.assert_error(response, 409, "pickup_time_not_passed")
+        with mock.patch("pickups.views.timezone.now", return_value=self.deadline):
+            response = self.admin_post(f"pickups/{pickup.pk}/no-show/", {"reason": "Terlambat."})
+        self.assert_error(response, 409, "deadline_passed")
+        pickup.refresh_from_db()
+        self.assertEqual(pickup.status, "SCHEDULED")
+
+    def test_admin_schedule_reason_is_required_and_rejects_unknown_fields(self):
+        payload = {
+            "scheduled_at": self.scheduled.isoformat(),
+            "instructions": "Temui petugas di pintu utama",
+        }
+        response = self.client.post(
+            f"/api/v1/admin/reservations/{self.reservation.id}/pickup/",
+            payload,
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400, response.content)
+        self.assertTrue(
+            any(
+                error["field"] == "reason"
+                and error["code"] == "required"
+                for error in response.data["errors"]
+            )
+        )
+    
+    def test_admin_audit_failure_rolls_back_domain_change(self):
+        pickup = make_pickup(self.reservation, self.scheduled)
+        client = APIClient()
+        client.force_login(self.admin)
+        client.raise_request_exception = False
+        with mock.patch("pickups.views._record_admin_pickup_audit", side_effect=RuntimeError("rollback")):
+            response = client.post(
+                f"{self.base}pickups/{pickup.pk}/complete/",
+                {"reason": "Audit wajib."}, format="json",
+            )
+        self.assertEqual(response.status_code, 500, response.content)
+        pickup.refresh_from_db()
+        self.assertEqual(pickup.status, "SCHEDULED")
