@@ -71,7 +71,9 @@ class RequestReadTests(TestCase):
     def test_public_only_open_unexpired_unarchived_positive_remaining(self):
         visible = self.make_request()
         for status in (RequestStatus.ALLOCATED, RequestStatus.FULFILLED, RequestStatus.CLOSED, RequestStatus.EXPIRED):
-            self.make_request(status=status)
+            source = self.make_request(status=status)
+            if status == RequestStatus.ALLOCATED:
+                self.offer(source, source.quantity_needed)
         self.make_request(valid_until=self.now - timedelta(seconds=1))
         self.make_request(archived_at=self.now)
         full = self.make_request()
@@ -213,6 +215,9 @@ class RequestReadTests(TestCase):
     def test_mine_includes_all_own_statuses_and_archive_but_no_other_users(self):
         own = [self.make_request(status=status, valid_until=self.now + timedelta(days=1), archived_at=self.now)
                for status in RequestStatus.values]
+        for source in own:
+            if source.status == RequestStatus.ALLOCATED:
+                self.offer(source, source.quantity_needed)
         self.make_request(owner=self.stranger)
         self.client.force_authenticate(self.owner)
         self.assertEqual(set(self.ids(self.client.get(self.url, {"scope": "mine"}))), {row.pk for row in own})
@@ -238,6 +243,9 @@ class RequestReadTests(TestCase):
 
     def test_every_nonpublic_case_is_hidden_from_strangers(self):
         sources = [self.make_request(status=status) for status in RequestStatus.values if status != RequestStatus.OPEN]
+        for source in sources:
+            if source.status == RequestStatus.ALLOCATED:
+                self.offer(source, source.quantity_needed)
         sources += [self.make_request(valid_until=self.now - timedelta(seconds=1)), self.make_request(archived_at=self.now)]
         full = self.make_request()
         self.offer(full, "20.000")

@@ -54,13 +54,14 @@ def requests_with_quantities(now=None):
             When(status__in=(RequestStatus.CLOSED, RequestStatus.EXPIRED, RequestStatus.FULFILLED), then=F("status")),
             When(quantity_fulfilled__gte=F("quantity_needed"), then=Value(RequestStatus.FULFILLED)),
             When(valid_until__lte=now, then=Value(RequestStatus.EXPIRED)),
-            default=F("status"), output_field=CharField(),
+            When(quantity_remaining__lte=0, then=Value(RequestStatus.ALLOCATED)),
+            default=Value(RequestStatus.OPEN), output_field=CharField(),
         ),
     )
 
 
 def public_requests(queryset):
-    return queryset.filter(status=RequestStatus.OPEN, valid_until__gt=timezone.now(),
+    return queryset.filter(effective_status=RequestStatus.OPEN, valid_until__gt=timezone.now(),
                            quantity_remaining__gt=0, archived_at__isnull=True)
 
 

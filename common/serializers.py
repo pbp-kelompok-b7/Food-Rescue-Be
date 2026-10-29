@@ -43,7 +43,7 @@ class RFC3339DateTimeField(serializers.DateTimeField):
 
     def to_internal_value(self, value):
         if not isinstance(value, str) or not re.fullmatch(
-            r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})", value
+            r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?(?:Z|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])", value
         ):
             self.fail("invalid", format="RFC3339 with timezone offset")
         return super().to_internal_value(value)

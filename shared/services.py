@@ -115,17 +115,18 @@ def effective_reservation_status(reservation, now=None):
     return ReservationStatus.CANCELLED if expiry_code(reservation, now) else reservation.status
 
 
-def recalculate_source(source, now=None):
-    """Reconcile a locked source from history; terminal states never reopen."""
+def effective_source_status(source, now=None, *, totals=None):
+    """Pure status calculation shared by writes and expiry reconciliation."""
     now = utc_now(now)
     listing = isinstance(source, ResourceListing)
-    totals = source_quantities(source, now)
+    if totals is None:
+        totals = source_quantities(source, now)
     terminal = ((ListingStatus.CLOSED, ListingStatus.EXPIRED, ListingStatus.COMPLETED) if listing
                 else (RequestStatus.CLOSED, RequestStatus.EXPIRED, RequestStatus.FULFILLED))
     total = source.quantity_total if listing else source.quantity_needed
     deadline = source.available_until if listing else source.valid_until
     if source.status in terminal:
-        return totals, False
+        return source.status
     if totals["completed"] >= total:
         status = ListingStatus.COMPLETED if listing else RequestStatus.FULFILLED
     elif deadline <= now:
@@ -136,6 +137,14 @@ def recalculate_source(source, now=None):
         status = ListingStatus.RESERVED if listing else RequestStatus.ALLOCATED
     else:
         status = ListingStatus.AVAILABLE if listing else RequestStatus.OPEN
+    return status
+
+
+def recalculate_source(source, now=None):
+    """Reconcile a locked source from history; terminal states never reopen."""
+    now = utc_now(now)
+    totals = source_quantities(source, now)
+    status = effective_source_status(source, now, totals=totals)
     if source.status == status:
         return totals, False
     source.status = status

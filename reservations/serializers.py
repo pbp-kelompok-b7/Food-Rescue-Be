@@ -16,7 +16,7 @@ from pickups.serializers import PickupSerializer
 from requests_app.models import RequestStatus
 from shared.enums import Mode, ResourceType, Suitability, Unit
 from .models import Reservation, ReservationStatus, SourceType
-from shared.services import source_quantities, expiry_code, effective_reservation_status, utc_now, recalculate_source, expiry_reason
+from shared.services import source_quantities, expiry_code, effective_reservation_status, utc_now, recalculate_source, expiry_reason, effective_source_status
 
 
 # Units that may only be claimed in whole-number quantities. ``kg`` allows
@@ -240,7 +240,8 @@ class ListingClaimCreateSerializer(StrictFieldsMixin, serializers.Serializer):
         # Source must be AVAILABLE and not past its deadline. The contract uses
         # a single ``source_not_accepting`` code for both conditions.
         if (
-            listing.status != ListingStatus.AVAILABLE
+            (listing.status != ListingStatus.AVAILABLE
+             and effective_source_status(listing) != ListingStatus.AVAILABLE)
             or listing.available_until <= timezone.now()
         ):
             raise BusinessConflict(
@@ -360,7 +361,8 @@ class RequestOfferCreateSerializer(StrictFieldsMixin, serializers.Serializer):
             )
 
         # Source must be OPEN and not past its valid_until.
-        if req.status != RequestStatus.OPEN or req.valid_until <= timezone.now():
+        if ((req.status != RequestStatus.OPEN and effective_source_status(req) != RequestStatus.OPEN)
+                or req.valid_until <= timezone.now()):
             raise BusinessConflict(
                 "This request is not accepting offers.", code="source_not_accepting"
             )
@@ -635,7 +637,8 @@ class ReservationAcceptSerializer(StrictFieldsMixin, serializers.Serializer):
         now = timezone.now()
         if reservation.source_type == SourceType.LISTING_CLAIM:
             # Source must still be AVAILABLE and before its deadline.
-            if source.status != ListingStatus.AVAILABLE:
+            if (source.status != ListingStatus.AVAILABLE
+                    and effective_source_status(source, now) != ListingStatus.AVAILABLE):
                 raise BusinessConflict(
                     "The listing is no longer accepting claims.",
                     code="source_not_accepting",
@@ -646,7 +649,8 @@ class ReservationAcceptSerializer(StrictFieldsMixin, serializers.Serializer):
                 )
             total = source.quantity_total
         else:
-            if source.status != RequestStatus.OPEN:
+            if (source.status != RequestStatus.OPEN
+                    and effective_source_status(source, now) != RequestStatus.OPEN):
                 raise BusinessConflict(
                     "The request is no longer accepting offers.",
                     code="source_not_accepting",
@@ -724,15 +728,7 @@ class ReservationAcceptSerializer(StrictFieldsMixin, serializers.Serializer):
 
         # Recompute source status now that this reservation is ACCEPTED and
         # therefore counts toward allocation. Full allocation flips the status.
-        fully_allocated = self.validated_data["_allocated_after"] >= self.validated_data["_total"]
-        if reservation.source_type == SourceType.LISTING_CLAIM:
-            if fully_allocated and source.status == ListingStatus.AVAILABLE:
-                source.status = ListingStatus.RESERVED
-                source.save(update_fields=["status", "updated_at"])
-        else:
-            if fully_allocated and source.status == RequestStatus.OPEN:
-                source.status = RequestStatus.ALLOCATED
-                source.save(update_fields=["status", "updated_at"])
+        recalculate_source(source, now)
 
         return reservation
 

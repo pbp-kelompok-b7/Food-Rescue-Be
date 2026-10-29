@@ -42,6 +42,13 @@ class PublicBrowseTests(TestCase):
         self.assertEqual(response.data["data"]["results"], [])
 
 class SharedContractRegressionTests(SimpleTestCase):
+    def test_rfc3339_rejects_out_of_range_offset_components(self):
+        from common.serializers import RFC3339DateTimeField
+        field = RFC3339DateTimeField()
+        for offset in ("+00:60", "-00:99", "+24:00"):
+            with self.subTest(offset=offset), self.assertRaises(ValidationError):
+                field.run_validation("2099-01-01T12:00:00" + offset)
+
     def test_claim_quantity_rejects_json_numbers(self):
         from reservations.serializers import ListingClaimCreateSerializer
         field = ListingClaimCreateSerializer().fields["quantity"]
@@ -300,6 +307,48 @@ class SharedThrottleConcurrencyTests(TransactionTestCase):
 
 
 class ExpiryContractTests(TestCase):
+    def test_released_request_allocation_is_open_before_worker_without_read_writes(self):
+        from datetime import timedelta
+        self.source.status = "ALLOCATED"
+        self.source.save()
+        expired = self.offer(quantity="20", deadline=self.now-timedelta(seconds=1))
+        before = (self.source.version, expired.version)
+        detail = APIClient().get(f"/api/v1/requests/{self.source.pk}/")
+        self.assertEqual(detail.status_code, 200, detail.data)
+        self.assertEqual(detail.data["data"]["status"], "OPEN")
+        rows = self.client.get("/api/v1/requests/?scope=mine&status=OPEN").data["data"]["results"]
+        self.assertEqual([row["id"] for row in rows], [self.source.pk])
+        self.source.refresh_from_db(); expired.refresh_from_db()
+        self.assertEqual((self.source.status, expired.status), ("ALLOCATED", "ACCEPTED"))
+        self.assertEqual((self.source.version, expired.version), before)
+
+    def test_acceptance_reuses_expired_allocation_before_worker(self):
+        from datetime import timedelta
+        self.source.status = "ALLOCATED"
+        self.source.save()
+        self.offer(quantity="20", deadline=self.now-timedelta(seconds=1))
+        pending = self.offer(quantity="4", status="PENDING")
+        response = self.client.post(f"/api/v1/reservations/{pending.pk}/accept/",
+                                   {"expected_version": 1}, format="json")
+        self.assertEqual(response.status_code, 200, response.data)
+        self.source.refresh_from_db()
+        self.assertEqual(self.source.status, "OPEN")
+
+    def test_new_offer_reuses_expired_allocation_before_worker(self):
+        from datetime import timedelta
+        self.source.status = "ALLOCATED"
+        self.source.save()
+        self.offer(quantity="20", deadline=self.now-timedelta(seconds=1))
+        self.client.force_authenticate(self.provider)
+        response = self.client.post(f"/api/v1/requests/{self.source.pk}/offers/", {
+            "resource_type": self.source.resource_type, "category": self.source.category,
+            "quantity": "4", "unit": "box", "mode": "DONATE", "unit_price": "0.00",
+            "title": "Makanan", "description": "Makanan", "condition": "Baik",
+            "suitability": [self.source.intended_use], "location": self.source.location,
+            "resource_deadline": (self.now+timedelta(hours=6)).isoformat(),
+        }, format="json")
+        self.assertEqual(response.status_code, 201, response.data)
+
     def setUp(self):
         from datetime import timedelta
         from django.contrib.auth import get_user_model
