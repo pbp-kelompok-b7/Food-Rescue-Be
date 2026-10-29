@@ -15,7 +15,7 @@ from common.pagination import ContractPagination
 from common.responses import failure, success
 from pickups.models import PickupStatus
 from reservations.models import Reservation, ReservationStatus
-from shared.models import AuditEvent
+from shared.models import AuditEvent, record_audit, audit_state
 from .models import ResourceRequest, RequestStatus
 from .serializers import (
     RequestCloseSerializer, RequestDeleteSerializer, RequestQuerySerializer,
@@ -124,6 +124,8 @@ def create_request(request):
     serializer.is_valid(raise_exception=True)
     with transaction.atomic():
         instance = ResourceRequest.objects.create(owner=user, created_by=user, **serializer.validated_data)
+        record_audit(actor=user, entity_type="ResourceRequest", entity_id=instance.pk,
+                     action="create", summary={"before": None, "after": audit_state(instance)})
         instance = requests_with_quantities().get(pk=instance.pk)
     return success(ResourceRequestSerializer(instance).data, message="Request created.", status=201)
 
@@ -148,6 +150,7 @@ def update_request(request, pk):
         serializer = RequestWriteSerializer(instance=instance, data=request.data, partial=True,
                                              context={"has_reservations": instance.reservations.exists()})
         serializer.is_valid(raise_exception=True)
+        before = audit_state(instance)
         changes = serializer.validated_data
         quantities = requests_with_quantities().get(pk=pk)
         needed = changes.get("quantity_needed", instance.quantity_needed)
@@ -169,12 +172,15 @@ def update_request(request, pk):
                 instance.status = RequestStatus.OPEN
         instance.version += 1
         instance.save(update_fields=[*changes, "status", "version", "updated_at"])
+        record_audit(actor=user, entity_type="ResourceRequest", entity_id=instance.pk,
+                     action="update", summary={"before": before, "after": audit_state(instance),
+                                               "changed_fields": sorted(changes)})
         instance = requests_with_quantities().get(pk=pk)
     return success(ResourceRequestSerializer(instance).data, message="Request updated.")
 
 
 # Lifecycle operations lock the source before reservations in primary-key order.
-# Keep the audit writer aligned with SF-BE-05 when its shared helper is available.
+# Audit writes use the shared SF-BE-05 helper in the same transaction.
 def _locked_request(user, pk):
     pk = str(pk)
     if not pk.isascii() or not pk.isdecimal() or len(pk) > 19 or not 0 < int(pk) <= 9223372036854775807:
@@ -197,7 +203,7 @@ def _state(source):
 
 
 def _audit(user, entity_type, entity_id, action, reason, before, after):
-    AuditEvent.objects.create(actor=user, entity_type=entity_type, entity_id=str(entity_id),
+    record_audit(actor=user, entity_type=entity_type, entity_id=str(entity_id),
                               action=action, summary={"reason": reason, "before": before, "after": after})
 
 

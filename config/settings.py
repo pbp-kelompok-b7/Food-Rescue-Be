@@ -40,6 +40,7 @@ MIDDLEWARE = [
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
+    "common.authentication.PrivateResponseMiddleware",
 ]
 
 ROOT_URLCONF = "config.urls"
@@ -94,6 +95,8 @@ REST_FRAMEWORK = {
     "DEFAULT_RENDERER_CLASSES": ["rest_framework.renderers.JSONRenderer"],
     "DEFAULT_PAGINATION_CLASS": "common.pagination.ContractPagination",
     "PAGE_SIZE": 20,
+    "DEFAULT_THROTTLE_CLASSES": ["common.authentication.ContractThrottle"],
+    "NUM_PROXIES": env.int("TRUSTED_PROXY_COUNT", default=0),
     "EXCEPTION_HANDLER": "common.exceptions.exception_handler",
 }
 CORS_ALLOWED_ORIGINS = env.list("CORS_ALLOWED_ORIGINS", default=["http://localhost:5173"])
@@ -107,3 +110,12 @@ CSRF_COOKIE_SECURE = not DEBUG
 SESSION_COOKIE_HTTPONLY = True
 SESSION_COOKIE_SAMESITE = "Lax"
 CSRF_COOKIE_SAMESITE = "Lax"
+
+# Operational defaults for contract section 10, overridable per deployment.
+CONTRACT_THROTTLE_RATES = {
+    "login": env("THROTTLE_LOGIN", default="10/min"),
+    "google_login": env("THROTTLE_GOOGLE_LOGIN", default="10/min"),
+    "location": env("THROTTLE_LOCATION", default="30/min"),
+    "submission": env("THROTTLE_SUBMISSION", default="30/min"),
+    "admin_write": env("THROTTLE_ADMIN_WRITE", default="30/min"),
+}

@@ -5,7 +5,9 @@ from django.shortcuts import get_object_or_404
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.permissions import IsAdminUser, IsAuthenticated
+from common.serializers import validate_query_params
 from common.pagination import ContractPagination
+from shared.models import record_audit, audit_state
 from common.responses import failure, success
 from listings.models import ResourceListing
 from requests_app.models import ResourceRequest
@@ -50,6 +52,8 @@ def listings_detail_claims(request, pk):
         )
         serializer.is_valid(raise_exception=True)
         reservation = serializer.save()
+        record_audit(actor=request.user, entity_type="Reservation", entity_id=reservation.pk,
+                     action="create", summary={"before": None, "after": audit_state(reservation)})
     return success(
         ReservationSerializer(reservation).data,
         message="Claim berhasil diajukan",
@@ -79,6 +83,8 @@ def requests_detail_offers(request, pk):
         )
         serializer.is_valid(raise_exception=True)
         reservation = serializer.save()
+        record_audit(actor=request.user, entity_type="Reservation", entity_id=reservation.pk,
+                     action="create", summary={"before": None, "after": audit_state(reservation)})
     return success(
         ReservationSerializer(reservation).data,
         message="Offer berhasil diajukan",
@@ -96,6 +102,7 @@ def reservations(request):
     Supports ``role`` (provider|receiver), ``status``, and ``source_type``
     filters, is paginated, and ordered by ``-created_at, -id``.
     """
+    validate_query_params(request.query_params, {"role", "status", "source_type", "page", "page_size"})
     user = request.user
     qs = (
         Reservation.objects.select_related(*_RESERVATION_SELECT_RELATED)
@@ -177,7 +184,12 @@ def reservations_detail(request, pk):
                 data=request.data, reservation=reservation, user=request.user
             )
             serializer.is_valid(raise_exception=True)
+            before = audit_state(reservation)
             serializer.save()
+            record_audit(actor=request.user, entity_type="Reservation", entity_id=reservation.pk,
+                         action="revise",
+                         summary={"reason": serializer.validated_data.get("reason", ""),
+                                  "before": before, "after": audit_state(reservation)})
         reservation.refresh_from_db()
         data = ReservationSerializer(reservation, context={"viewer": request.user}).data
         return success(data, message="Perubahan berhasil disimpan")
@@ -231,7 +243,12 @@ def reservations_detail_accept(request, pk):
             source_obj=source,
         )
         serializer.is_valid(raise_exception=True)
+        before = audit_state(reservation)
         serializer.save()
+        record_audit(actor=request.user, entity_type="Reservation", entity_id=reservation.pk,
+                     action="accept",
+                     summary={"reason": serializer.validated_data.get("reason", ""),
+                              "before": before, "after": audit_state(reservation)})
     reservation.refresh_from_db()
     data = ReservationSerializer(reservation, context={"viewer": request.user}).data
     return success(data, message="Pengajuan diterima")
@@ -258,7 +275,12 @@ def reservations_detail_reject(request, pk):
             data=request.data, reservation=reservation, user=request.user
         )
         serializer.is_valid(raise_exception=True)
+        before = audit_state(reservation)
         serializer.save()
+        record_audit(actor=request.user, entity_type="Reservation", entity_id=reservation.pk,
+                     action="reject",
+                     summary={"reason": serializer.validated_data.get("reason", ""),
+                              "before": before, "after": audit_state(reservation)})
     reservation.refresh_from_db()
     data = ReservationSerializer(reservation, context={"viewer": request.user}).data
     return success(data, message="Pengajuan ditolak")
@@ -290,7 +312,12 @@ def reservations_detail_cancel(request, pk):
             source_obj=source,
         )
         serializer.is_valid(raise_exception=True)
+        before = audit_state(reservation)
         serializer.save()
+        record_audit(actor=request.user, entity_type="Reservation", entity_id=reservation.pk,
+                     action="cancel",
+                     summary={"reason": serializer.validated_data.get("reason", ""),
+                              "before": before, "after": audit_state(reservation)})
     reservation.refresh_from_db()
     data = ReservationSerializer(reservation, context={"viewer": request.user}).data
     return success(data, message="Reservation dibatalkan")
@@ -305,6 +332,7 @@ def admin_reservations(request):
     Filters: status, provider_id, receiver_id, source_type. Paginated, ordered
     -created_at, -id. Not scoped to the caller (admin sees everything).
     """
+    validate_query_params(request.query_params, {"status", "provider_id", "receiver_id", "source_type", "page", "page_size"})
     qs = (
         Reservation.objects.select_related(*_RESERVATION_SELECT_RELATED)
         .all()
@@ -360,7 +388,12 @@ def admin_reservations_detail(request, pk):
                 data=request.data, reservation=reservation, user=request.user, is_admin=True
             )
             serializer.is_valid(raise_exception=True)
+            before = audit_state(reservation)
             serializer.save()
+            record_audit(actor=request.user, entity_type="Reservation", entity_id=reservation.pk,
+                         action="revise",
+                         summary={"reason": serializer.validated_data.get("reason", ""),
+                                  "before": before, "after": audit_state(reservation)})
         reservation.refresh_from_db()
         return success(
             AdminReservationSerializer(reservation).data,
@@ -387,7 +420,12 @@ def admin_reservations_detail_accept(request, pk):
             is_admin=True,
         )
         serializer.is_valid(raise_exception=True)
+        before = audit_state(reservation)
         serializer.save()
+        record_audit(actor=request.user, entity_type="Reservation", entity_id=reservation.pk,
+                     action="accept",
+                     summary={"reason": serializer.validated_data.get("reason", ""),
+                              "before": before, "after": audit_state(reservation)})
     reservation.refresh_from_db()
     return success(AdminReservationSerializer(reservation).data, message="Pengajuan diterima")
 
@@ -405,7 +443,12 @@ def admin_reservations_detail_reject(request, pk):
             data=request.data, reservation=reservation, user=request.user, is_admin=True
         )
         serializer.is_valid(raise_exception=True)
+        before = audit_state(reservation)
         serializer.save()
+        record_audit(actor=request.user, entity_type="Reservation", entity_id=reservation.pk,
+                     action="reject",
+                     summary={"reason": serializer.validated_data.get("reason", ""),
+                              "before": before, "after": audit_state(reservation)})
     reservation.refresh_from_db()
     return success(AdminReservationSerializer(reservation).data, message="Pengajuan ditolak")
 
@@ -428,6 +471,11 @@ def admin_reservations_detail_cancel(request, pk):
             source_obj=source,
         )
         serializer.is_valid(raise_exception=True)
+        before = audit_state(reservation)
         serializer.save()
+        record_audit(actor=request.user, entity_type="Reservation", entity_id=reservation.pk,
+                     action="cancel",
+                     summary={"reason": serializer.validated_data.get("reason", ""),
+                              "before": before, "after": audit_state(reservation)})
     reservation.refresh_from_db()
     return success(AdminReservationSerializer(reservation).data, message="Reservation dibatalkan")

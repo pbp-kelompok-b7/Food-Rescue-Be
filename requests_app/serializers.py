@@ -5,6 +5,7 @@ from decimal import Decimal
 
 from django.utils import timezone
 from rest_framework import serializers
+from common.serializers import DecimalStringField, RFC3339DateTimeField
 
 from common.exceptions import BusinessConflict
 from shared.enums import ResourceType, Suitability, Unit
@@ -93,13 +94,6 @@ class StrictObjectSerializer(serializers.Serializer):
         return super().to_internal_value(data)
 
 
-class DecimalStringField(serializers.DecimalField):
-    def to_internal_value(self, data):
-        if not isinstance(data, str) or not re.fullmatch(r"-?[0-9]+(?:\.[0-9]+)?", data):
-            raise serializers.ValidationError("Expected a decimal string.")
-        return super().to_internal_value(data)
-
-
 class CoordinateField(serializers.FloatField):
     def to_internal_value(self, data):
         try:
@@ -143,7 +137,7 @@ class RequestWriteSerializer(StrictObjectSerializer):
     donate_only = serializers.BooleanField(default=False)
     max_unit_price = DecimalStringField(max_digits=15, decimal_places=2, min_value=Decimal("0"),
                                        allow_null=True, default=None)
-    valid_until = serializers.DateTimeField()
+    valid_until = RFC3339DateTimeField()
 
     def validate_donate_only(self, value):
         if type(self.initial_data.get("donate_only", False)) is not bool:

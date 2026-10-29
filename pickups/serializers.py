@@ -4,6 +4,7 @@ from django.utils import timezone
 from rest_framework import serializers
 from rest_framework.exceptions import ErrorDetail
 from .models import Pickup
+from common.serializers import RFC3339DateTimeField, validate_query_params
 
 RFC3339 = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$")
 
@@ -29,6 +30,9 @@ class StrictFieldsSerializer(serializers.Serializer):
     unknown_field_messages = {}
 
     def to_internal_value(self, data):
+        if hasattr(data, "getlist"):
+            validate_query_params(data, set(self.fields))
+            data = {key: data[key] for key in data}
         if isinstance(data, dict):
             unknown = set(data) - set(self.fields)
             if unknown:
@@ -50,7 +54,7 @@ class AdminFieldsSerializerWithReason(StrictFieldsSerializer):
         return value
     
 class PickupScheduleSerializer(StrictFieldsSerializer):
-    scheduled_at = serializers.DateTimeField()
+    scheduled_at = RFC3339DateTimeField()
     instructions = serializers.CharField(
         max_length=2000, allow_null=True, allow_blank=True, required=False, default=None
     )

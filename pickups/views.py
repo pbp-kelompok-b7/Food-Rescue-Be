@@ -10,7 +10,7 @@ from common.responses import *
 from reservations.models import Reservation, ReservationStatus, SourceType
 from listings.models import ListingStatus, ResourceListing
 from requests_app.models import RequestStatus, ResourceRequest
-from shared.models import AuditEvent
+from shared.models import AuditEvent, record_audit, audit_state
 from .models import Pickup, PickupStatus
 from .serializers import *
 
@@ -80,7 +80,7 @@ def _lock_source_then_reservation(reservation_id):
 
 def _record_admin_pickup_audit(*, actor, action, pickup, reason, before, after):
     """Record moderator changes in the same transaction as the domain mutation."""
-    AuditEvent.objects.create(
+    record_audit(
         actor=actor,
         entity_type="Pickup",
         entity_id=str(pickup.pk),
@@ -141,6 +141,8 @@ def reservations_detail_pickup(request, pk):
         except IntegrityError:
             raise BusinessConflict("Reservation sudah memiliki pickup.", code="pickup_exists")
 
+        record_audit(actor=user, entity_type="Pickup", entity_id=pickup.pk, action="schedule",
+                     summary={"before": None, "after": audit_state(pickup)})
     return success(PickupSerializer(pickup).data, "Pickup dijadwalkan", status=201)
 
 
@@ -233,10 +235,14 @@ def pickups_detail(request, pk):
  
             data = serializer.validated_data
             if "instructions" in data and data["instructions"] != pickup.instructions:
+                before = audit_state(pickup)
                 pickup.instructions = data["instructions"]
                 pickup.version += 1
                 pickup.updated_at = timezone.now()
                 pickup.save()
+                record_audit(actor=user, entity_type="Pickup", entity_id=pickup.pk, action="update",
+                             summary={"before": before, "after": audit_state(pickup),
+                                      "changed_fields": ["instructions"]})
         
         return success(PickupSerializer(pickup).data, "Instruksi pickup diperbarui", status=200)
 
@@ -276,12 +282,15 @@ def pickups_detail_complete(request, pk):
         if now >= reservation.resource_deadline:
             raise BusinessConflict("Deadline resource telah terlewati.", code="deadline_passed")
         
+        before = audit_state(pickup)
         pickup.status = PickupStatus.COMPLETED
         pickup.completed_at = now
         pickup.version += 1
         pickup.updated_at = now
         pickup.save()
         _recalculate_source(reservation, source, now)
+        record_audit(actor=user, entity_type="Pickup", entity_id=pickup.pk, action="complete",
+                     summary={"before": before, "after": audit_state(pickup)})
 
     return success(PickupSerializer(pickup).data, "Pickup diselesaikan", status=200)
 
@@ -325,6 +334,8 @@ def pickups_detail_no_show(request, pk):
         if now >= reservation.resource_deadline:
             raise BusinessConflict("Deadline resource telah terlewati.", code="deadline_passed")
 
+        before = audit_state(pickup)
+        reservation_before = audit_state(reservation)
         pickup.status = PickupStatus.NO_SHOW
         pickup.no_show_at = now
         pickup.version += 1
@@ -337,6 +348,11 @@ def pickups_detail_no_show(request, pk):
         reservation.updated_at = now
         reservation.save()
         _recalculate_source(reservation, source, now)
+        record_audit(actor=user, entity_type="Pickup", entity_id=pickup.pk, action="no_show",
+                     summary={"reason": reservation.reason, "before": before, "after": audit_state(pickup)})
+        record_audit(actor=user, entity_type="Reservation", entity_id=reservation.pk, action="cancel",
+                     summary={"reason": reservation.reason, "before": reservation_before,
+                              "after": audit_state(reservation)})
 
     return success(PickupSerializer(pickup).data, "Pickup ditandai no-show", status=200)
 

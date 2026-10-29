@@ -9,6 +9,7 @@ from rest_framework.exceptions import PermissionDenied
 from rest_framework.renderers import JSONRenderer
 
 from common.exceptions import BusinessConflict
+from common.serializers import StrictSerializer, DecimalStringField, RFC3339DateTimeField, CoordinateField, StringField
 from listings.models import ListingStatus
 from pickups.models import PickupStatus
 from pickups.serializers import PickupSerializer
@@ -32,22 +33,8 @@ def _decimal_str(value, places):
     return str(Decimal(value).quantize(quantum))
 
 
-class StrictFieldsMixin:
-    """Reject unknown / read-only fields with 400 (contract section 7.0).
-
-    The contract states requests must not send server-owned or unknown fields;
-    doing so is a validation error rather than silently ignored.
-    """
-
-    def to_internal_value(self, data):
-        if isinstance(data, dict):
-            allowed = set(self.fields)
-            unknown = [key for key in data if key not in allowed]
-            if unknown:
-                raise serializers.ValidationError(
-                    {key: ["Unknown or read-only field."] for key in sorted(unknown)}
-                )
-        return super().to_internal_value(data)
+class StrictFieldsMixin(StrictSerializer):
+    """Shared unknown/read-only-field validation."""
 
 
 class UserRefSerializer(serializers.Serializer):
@@ -57,7 +44,7 @@ class UserRefSerializer(serializers.Serializer):
     display_name = serializers.CharField()
 
 
-class LocationSerializer(serializers.Serializer):
+class LocationSerializer(StrictSerializer):
     """Resource location per the contract (sections 7.2.2 / 7.4.2).
 
     ``label`` 1-300, ``area`` 1-100, ``latitude`` -90..90, ``longitude``
@@ -66,8 +53,8 @@ class LocationSerializer(serializers.Serializer):
 
     label = serializers.CharField(max_length=300, min_length=1)
     area = serializers.CharField(max_length=100, min_length=1)
-    latitude = serializers.FloatField(min_value=-90, max_value=90)
-    longitude = serializers.FloatField(min_value=-180, max_value=180)
+    latitude = CoordinateField(min_value=-90, max_value=90)
+    longitude = CoordinateField(min_value=-180, max_value=180)
 
 
 class ReservationSerializer(serializers.Serializer):
@@ -118,7 +105,7 @@ class ReservationSerializer(serializers.Serializer):
                 "packaging_status": listing.packaging_status,
             }
         else:
-            terms = dict(obj.resource_data or {})
+            terms = {key: value for key, value in (obj.resource_data or {}).items() if key in OFFER_RESOURCE_KEYS}
         terms.update(
             {
                 "quantity": _decimal_str(obj.quantity, 3),
@@ -215,7 +202,7 @@ class ListingClaimCreateSerializer(StrictFieldsMixin, serializers.Serializer):
     cannot forge price/owner/status.
     """
 
-    quantity = serializers.DecimalField(max_digits=15, decimal_places=3)
+    quantity = DecimalStringField(max_digits=15, decimal_places=3)
 
     def __init__(self, *args, listing=None, user=None, **kwargs):
         self.listing = listing
@@ -320,7 +307,7 @@ class RequestOfferCreateSerializer(StrictFieldsMixin, serializers.Serializer):
     description = serializers.CharField(max_length=5000)
     unit = serializers.ChoiceField(choices=Unit.choices)
     mode = serializers.ChoiceField(choices=Mode.choices)
-    unit_price = serializers.DecimalField(max_digits=15, decimal_places=2, min_value=Decimal("0"))
+    unit_price = DecimalStringField(max_digits=15, decimal_places=2, min_value=Decimal("0"))
     condition = serializers.CharField(max_length=1000)
     suitability = serializers.ListField(
         child=serializers.ChoiceField(choices=Suitability.choices), allow_empty=False
@@ -329,8 +316,8 @@ class RequestOfferCreateSerializer(StrictFieldsMixin, serializers.Serializer):
     storage_notes = serializers.CharField(max_length=2000, required=False, allow_null=True, default=None)
     allergen_notes = serializers.CharField(max_length=2000, required=False, allow_null=True, default=None)
     packaging_status = serializers.CharField(max_length=200, required=False, allow_null=True, default=None)
-    quantity = serializers.DecimalField(max_digits=15, decimal_places=3)
-    resource_deadline = serializers.DateTimeField()
+    quantity = DecimalStringField(max_digits=15, decimal_places=3)
+    resource_deadline = RFC3339DateTimeField()
 
     def __init__(self, *args, request_obj=None, user=None, **kwargs):
         self.request_obj = request_obj
@@ -464,9 +451,9 @@ class ReservationReviseSerializer(StrictFieldsMixin, serializers.Serializer):
     reallocated.
     """
 
-    quantity = serializers.DecimalField(max_digits=15, decimal_places=3, required=False)
+    quantity = DecimalStringField(max_digits=15, decimal_places=3, required=False)
     expected_version = serializers.IntegerField()
-    reason = serializers.CharField(min_length=1, max_length=1000, required=False)
+    reason = StringField(min_length=1, max_length=1000, required=False)
 
     def __init__(self, *args, reservation=None, user=None, is_admin=False, **kwargs):
         self.reservation = reservation
@@ -597,7 +584,7 @@ class ReservationAcceptSerializer(StrictFieldsMixin, serializers.Serializer):
     """
 
     expected_version = serializers.IntegerField()
-    reason = serializers.CharField(min_length=1, max_length=1000, required=False)
+    reason = StringField(min_length=1, max_length=1000, required=False)
 
     def __init__(self, *args, reservation=None, user=None, source_obj=None, is_admin=False, **kwargs):
         # NOTE: ``source`` is reserved by DRF's Field/Serializer machinery, so
@@ -761,7 +748,7 @@ class ReservationRejectSerializer(StrictFieldsMixin, serializers.Serializer):
     409 ``stale_version``). REJECTED is terminal and does not change quantity.
     """
 
-    reason = serializers.CharField(min_length=1, max_length=1000)
+    reason = StringField(min_length=1, max_length=1000)
     expected_version = serializers.IntegerField()
 
     def __init__(self, *args, reservation=None, user=None, is_admin=False, **kwargs):
@@ -828,7 +815,7 @@ class ReservationCancelSerializer(StrictFieldsMixin, serializers.Serializer):
     reservation).
     """
 
-    reason = serializers.CharField(min_length=1, max_length=1000)
+    reason = StringField(min_length=1, max_length=1000)
 
     def __init__(self, *args, reservation=None, user=None, source_obj=None, **kwargs):
         self.reservation = reservation
