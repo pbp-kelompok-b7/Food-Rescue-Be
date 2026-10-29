@@ -211,7 +211,7 @@ class RequestReadTests(TestCase):
             self.assertIn("no-store", response.get("Cache-Control", ""))
 
     def test_mine_includes_all_own_statuses_and_archive_but_no_other_users(self):
-        own = [self.make_request(status=status, valid_until=self.now - timedelta(days=1), archived_at=self.now)
+        own = [self.make_request(status=status, valid_until=self.now + timedelta(days=1), archived_at=self.now)
                for status in RequestStatus.values]
         self.make_request(owner=self.stranger)
         self.client.force_authenticate(self.owner)

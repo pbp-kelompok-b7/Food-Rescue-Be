@@ -16,6 +16,7 @@ from pickups.serializers import PickupSerializer
 from requests_app.models import RequestStatus
 from shared.enums import Mode, ResourceType, Suitability, Unit
 from .models import Reservation, ReservationStatus, SourceType
+from shared.services import source_quantities, expiry_code, effective_reservation_status, utc_now, recalculate_source, expiry_reason
 
 
 # Units that may only be claimed in whole-number quantities. ``kg`` allows
@@ -77,7 +78,7 @@ class ReservationSerializer(serializers.Serializer):
     provider = UserRefSerializer()
     receiver = UserRefSerializer()
     submitted_by_id = serializers.IntegerField()
-    status = serializers.CharField()
+    status = serializers.SerializerMethodField()
     terms = serializers.SerializerMethodField()
     accepted_snapshot = serializers.JSONField()
     accepted_at = serializers.DateTimeField(allow_null=True)
@@ -85,6 +86,12 @@ class ReservationSerializer(serializers.Serializer):
     cancellation_code = serializers.SerializerMethodField()
     pickup = serializers.SerializerMethodField()
     counterparty_contact = serializers.SerializerMethodField()
+
+    def _expiry_now(self):
+        return self.context.setdefault("_expiry_now", utc_now())
+
+    def get_status(self, obj):
+        return effective_reservation_status(obj, self._expiry_now())
 
     def get_terms(self, obj):
         # For a listing claim the resource detail is taken from the listing at
@@ -119,10 +126,11 @@ class ReservationSerializer(serializers.Serializer):
         return terms
 
     def get_reason(self, obj):
-        return obj.reason or None
+        code = expiry_code(obj, self._expiry_now())
+        return expiry_reason(code) if code else obj.reason or None
 
     def get_cancellation_code(self, obj):
-        return obj.cancellation_code or None
+        return expiry_code(obj, self._expiry_now()) or obj.cancellation_code or None
 
     def get_pickup(self, obj):
         # A reservation has at most one pickup (section 7.5). Render it when it
@@ -132,7 +140,7 @@ class ReservationSerializer(serializers.Serializer):
             return None
         # Reuse the pickups app serializer so the nested pickup shape stays in
         # one place (section 7.5).
-        return PickupSerializer(pickup).data
+        return PickupSerializer(pickup, context=self.context).data
 
     def get_counterparty_contact(self, obj):
         """Contact of the transaction partner, relative to the viewer.
@@ -144,7 +152,7 @@ class ReservationSerializer(serializers.Serializer):
         contacts, so admin moderation uses the admin detail endpoint instead.
         """
         viewer = self.context.get("viewer")
-        if viewer is None or obj.status != ReservationStatus.ACCEPTED:
+        if viewer is None or self.get_status(obj) != ReservationStatus.ACCEPTED:
             return None
 
         if viewer.id == obj.provider_id:
@@ -241,10 +249,7 @@ class ListingClaimCreateSerializer(StrictFieldsMixin, serializers.Serializer):
 
         # Requested quantity must not exceed the available quantity at create
         # time. PENDING claims do not allocate stock; only ACCEPTED do.
-        allocated = listing.reservations.filter(
-            status__in=ACTIVE_ALLOCATION_STATUSES
-        ).aggregate(total=Sum("quantity"))["total"] or Decimal("0")
-        available = listing.quantity_total - allocated
+        available = source_quantities(listing)["remaining"]
         if attrs["quantity"] > available:
             raise BusinessConflict(
                 f"Requested quantity exceeds the available quantity ({available}).",
@@ -407,10 +412,7 @@ class RequestOfferCreateSerializer(StrictFieldsMixin, serializers.Serializer):
 
         # Requested quantity must not exceed the remaining need at create time.
         # PENDING offers do not allocate; only ACCEPTED reservations do.
-        allocated = req.reservations.filter(
-            status__in=ACTIVE_ALLOCATION_STATUSES
-        ).aggregate(total=Sum("quantity"))["total"] or Decimal("0")
-        remaining = req.quantity_needed - allocated
+        remaining = source_quantities(req)["remaining"]
         if attrs["quantity"] > remaining:
             raise BusinessConflict(
                 f"Offer quantity exceeds the remaining need ({remaining}).",
@@ -479,7 +481,7 @@ class ReservationReviseSerializer(StrictFieldsMixin, serializers.Serializer):
             raise serializers.ValidationError({"reason": "This field is required."})
 
         # Only PENDING submissions can be revised.
-        if reservation.status != ReservationStatus.PENDING:
+        if effective_reservation_status(reservation) != ReservationStatus.PENDING:
             raise BusinessConflict(
                 "Only a pending reservation can be revised.", code="invalid_transition"
             )
@@ -507,10 +509,7 @@ class ReservationReviseSerializer(StrictFieldsMixin, serializers.Serializer):
             source = reservation.request
             total = source.quantity_needed
             label = "remaining"
-        allocated = source.reservations.filter(
-            status__in=ACTIVE_ALLOCATION_STATUSES
-        ).aggregate(total=Sum("quantity"))["total"] or Decimal("0")
-        headroom = total - allocated
+        headroom = source_quantities(source)["remaining"]
         if new_quantity > headroom:
             raise BusinessConflict(
                 f"Revised quantity exceeds the {label} quantity ({headroom}).",
@@ -671,10 +670,8 @@ class ReservationAcceptSerializer(StrictFieldsMixin, serializers.Serializer):
 
         # Availability re-check excluding this reservation. Only ACCEPTED
         # reservations hold allocation; this one is still PENDING.
-        allocated = source.reservations.filter(
-            status=ReservationStatus.ACCEPTED
-        ).aggregate(total=Sum("quantity"))["total"] or Decimal("0")
-        available = total - allocated
+        totals = source_quantities(source, now)
+        available = totals["remaining"]
         if reservation.quantity > available:
             raise BusinessConflict(
                 f"Not enough quantity remains to accept this reservation ({available}).",
@@ -682,7 +679,7 @@ class ReservationAcceptSerializer(StrictFieldsMixin, serializers.Serializer):
             )
 
         attrs["_total"] = total
-        attrs["_allocated_after"] = allocated + reservation.quantity
+        attrs["_allocated_after"] = totals["allocated"] + totals["completed"] + reservation.quantity
         attrs["_now"] = now
         # For a claim the resource deadline is owned by the listing, which may
         # have been edited since the claim was submitted. Re-sync it from the
@@ -761,7 +758,7 @@ class ReservationRejectSerializer(StrictFieldsMixin, serializers.Serializer):
         reservation = self.reservation
         user = self.user
 
-        if reservation.status != ReservationStatus.PENDING:
+        if effective_reservation_status(reservation) != ReservationStatus.PENDING:
             raise BusinessConflict(
                 "Only a pending reservation can be rejected.",
                 code="invalid_transition",
@@ -883,13 +880,6 @@ class ReservationCancelSerializer(StrictFieldsMixin, serializers.Serializer):
         # ACCEPTED, so it stops counting toward the source's allocation. Recompute
         # and reopen the source only if it is still active and before its deadline.
         if was_accepted:
-            if reservation.source_type == SourceType.LISTING_CLAIM:
-                if source.status == ListingStatus.RESERVED and source.available_until > now:
-                    source.status = ListingStatus.AVAILABLE
-                    source.save(update_fields=["status", "updated_at"])
-            else:
-                if source.status == RequestStatus.ALLOCATED and source.valid_until > now:
-                    source.status = RequestStatus.OPEN
-                    source.save(update_fields=["status", "updated_at"])
+            recalculate_source(source, now)
 
         return reservation

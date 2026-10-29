@@ -119,3 +119,6 @@ CONTRACT_THROTTLE_RATES = {
     "submission": env("THROTTLE_SUBMISSION", default="30/min"),
     "admin_write": env("THROTTLE_ADMIN_WRITE", default="30/min"),
 }
+
+# Operational cadence only; no worker starts with runserver.
+EXPIRY_INTERVAL_SECONDS = env.float("EXPIRY_INTERVAL_SECONDS", default=60)

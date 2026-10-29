@@ -1,7 +1,7 @@
 from decimal import Decimal
 
 from django.db import transaction
-from django.db.models import DecimalField, Exists, F, OuterRef, Q, Subquery, Sum, Value
+from django.db.models import Case, CharField, When, DecimalField, Exists, F, OuterRef, Q, Subquery, Sum, Value
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 from django.views.decorators.cache import never_cache
@@ -16,6 +16,7 @@ from common.responses import failure, success
 from pickups.models import PickupStatus
 from reservations.models import Reservation, ReservationStatus
 from shared.models import AuditEvent, record_audit, audit_state
+from shared.services import allocated_filter, completed_filter, utc_now
 from .models import ResourceRequest, RequestStatus
 from .serializers import (
     RequestCloseSerializer, RequestDeleteSerializer, RequestQuerySerializer,
@@ -33,7 +34,8 @@ class RequestPagination(ContractPagination):
             raise NotFound("Page does not exist.", code="page_not_found") from exc
 
 
-def requests_with_quantities():
+def requests_with_quantities(now=None):
+    now = utc_now(now)
     quantity_field = DecimalField(max_digits=15, decimal_places=3)
     accepted = Reservation.objects.filter(
         request_id=OuterRef("pk"), status=ReservationStatus.ACCEPTED,
@@ -45,11 +47,16 @@ def requests_with_quantities():
                         Value(Decimal("0.000")), output_field=quantity_field)
 
     return ResourceRequest.objects.select_related("owner").annotate(
-        quantity_allocated=total(accepted.exclude(pickup__status__in=(
-            PickupStatus.COMPLETED, PickupStatus.CANCELLED, PickupStatus.NO_SHOW,
-        ))),
-        quantity_fulfilled=total(accepted.filter(pickup__status=PickupStatus.COMPLETED)),
-    ).annotate(quantity_remaining=F("quantity_needed") - F("quantity_allocated") - F("quantity_fulfilled"))
+        quantity_allocated=total(accepted.filter(allocated_filter(now))),
+        quantity_fulfilled=total(accepted.filter(completed_filter())),
+    ).annotate(quantity_remaining=F("quantity_needed") - F("quantity_allocated") - F("quantity_fulfilled")).annotate(
+        effective_status=Case(
+            When(status__in=(RequestStatus.CLOSED, RequestStatus.EXPIRED, RequestStatus.FULFILLED), then=F("status")),
+            When(quantity_fulfilled__gte=F("quantity_needed"), then=Value(RequestStatus.FULFILLED)),
+            When(valid_until__lte=now, then=Value(RequestStatus.EXPIRED)),
+            default=F("status"), output_field=CharField(),
+        ),
+    )
 
 
 def public_requests(queryset):
@@ -73,7 +80,7 @@ def browse_requests(request):
 
     for field in ("resource_type", "category", "intended_use", "status"):
         if field in filters:
-            queryset = queryset.filter(**{field: filters[field]})
+            queryset = queryset.filter(**{("effective_status" if field == "status" else field): filters[field]})
     if "donate_only" in filters:
         queryset = queryset.filter(donate_only=filters["donate_only"] == "true")
     if "area" in filters:

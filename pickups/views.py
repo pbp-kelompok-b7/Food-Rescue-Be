@@ -12,52 +12,15 @@ from listings.models import ListingStatus, ResourceListing
 from requests_app.models import RequestStatus, ResourceRequest
 from shared.models import AuditEvent, record_audit, audit_state
 from .models import Pickup, PickupStatus
+from shared.services import recalculate_source, expiry_code, with_effective_status, utc_now
 from .serializers import *
 
 
 def _recalculate_source(reservation, source, now):
-    """Recalculate a source's lifecycle status from its accepted quantities."""
-    accepted = Reservation.objects.filter(status=ReservationStatus.ACCEPTED)
-    if reservation.source_type == SourceType.LISTING_CLAIM:
-        if source is None or source.status in (
-            ListingStatus.CLOSED, ListingStatus.EXPIRED, ListingStatus.COMPLETED
-        ):
-            return
-        totals = accepted.filter(listing_id=source.pk).aggregate(
-            allocated=Sum("quantity"),
-            completed=Sum("quantity", filter=Q(pickup__status=PickupStatus.COMPLETED)),
-        )
-        allocated = totals["allocated"] or 0
-        completed = totals["completed"] or 0
-        if completed >= source.quantity_total:
-            new_status = ListingStatus.COMPLETED
-        elif allocated >= source.quantity_total:
-            new_status = ListingStatus.RESERVED
-        else:
-            new_status = ListingStatus.AVAILABLE
-    else:
-        if source is None or source.status in (
-            RequestStatus.CLOSED, RequestStatus.EXPIRED, RequestStatus.FULFILLED
-        ):
-            return
-        totals = accepted.filter(request_id=source.pk).aggregate(
-            allocated=Sum("quantity"),
-            completed=Sum("quantity", filter=Q(pickup__status=PickupStatus.COMPLETED)),
-        )
-        allocated = totals["allocated"] or 0
-        completed = totals["completed"] or 0
-        if completed >= source.quantity_needed:
-            new_status = RequestStatus.FULFILLED
-        elif allocated >= source.quantity_needed:
-            new_status = RequestStatus.ALLOCATED
-        else:
-            new_status = RequestStatus.OPEN
+    """Use the same history/deadline calculation as the expiry command."""
+    if source is not None:
+        recalculate_source(source, now)
 
-    if source.status != new_status:
-        source.status = new_status
-        source.version += 1
-        source.updated_at = now
-        source.save()
 
 def _lock_source_then_reservation(reservation_id):
     ref = Reservation.objects.filter(pk=reservation_id).values(
@@ -121,7 +84,7 @@ def reservations_detail_pickup(request, pk):
             raise BusinessConflict("Reservation sudah memiliki pickup.", code="pickup_exists")
         if not (reservation.provider.whatsapp_number and reservation.receiver.whatsapp_number):
             raise BusinessConflict("Nomor WhatsApp provider dan receiver wajib diisi.", code="contact_required")
-        if timezone.now() >= reservation.resource_deadline or scheduled_at >= reservation.resource_deadline:
+        if expiry_code(reservation) is not None or scheduled_at >= reservation.resource_deadline:
             raise BusinessConflict(
                 {"scheduled_at": "Jadwal harus lebih awal dari deadline resource."}, code="deadline_passed"
             )
@@ -165,9 +128,11 @@ def pickups(request):
         queryset = Pickup.objects.filter(
             Q(reservation__provider_id=user.pk) | Q(reservation__receiver_id=user.pk)
         )
+    now = utc_now()
+    queryset = with_effective_status(queryset, now, pickup=True)
     if "status" in params:
-        queryset = queryset.filter(status=params["status"])
-    queryset = queryset.order_by("-scheduled_at", "-id")
+        queryset = queryset.filter(effective_status=params["status"])
+    queryset = queryset.select_related("reservation__listing", "reservation__request").order_by("-scheduled_at", "-id")
  
     paginator = PageNumberPagination()
     paginator.page_size = params.get("page_size", 20)
@@ -181,7 +146,7 @@ def pickups(request):
             "count": paginator.page.paginator.count,
             "next": paginator.get_next_link(),
             "previous": paginator.get_previous_link(),
-            "results": PickupSerializer(page, many=True).data,
+            "results": PickupSerializer(page, many=True, context={"_expiry_now": now}).data,
         },
         "Daftar Pickup",
         status=200,
@@ -199,7 +164,7 @@ def pickups_detail(request, pk):
     user = request.user
  
     if request.method == "GET":
-        pickup = Pickup.objects.select_related("reservation").filter(pk=pk).first()
+        pickup = Pickup.objects.select_related("reservation__listing", "reservation__request").filter(pk=pk).first()
         if pickup is None or not (
             user.is_admin or user.pk in (pickup.reservation.provider_id, pickup.reservation.receiver_id)
             ):
@@ -230,7 +195,7 @@ def pickups_detail(request, pk):
                 raise BusinessConflict(
                     "Pickup harus SCHEDULED dan reservation harus berstatus ACCEPTED.", code="invalid_transition"
                 )
-            if timezone.now() >= reservation.resource_deadline:
+            if expiry_code(reservation) is not None:
                 raise BusinessConflict("Deadline resource telah terlewati.", code="deadline_passed")
  
             data = serializer.validated_data
@@ -279,7 +244,7 @@ def pickups_detail_complete(request, pk):
         serializer.is_valid(raise_exception=True)
 
         now = timezone.now()
-        if now >= reservation.resource_deadline:
+        if expiry_code(reservation, now) is not None:
             raise BusinessConflict("Deadline resource telah terlewati.", code="deadline_passed")
         
         before = audit_state(pickup)
@@ -331,7 +296,7 @@ def pickups_detail_no_show(request, pk):
         now = timezone.now()
         if now <= pickup.scheduled_at:
             raise BusinessConflict("No-show hanya dapat dicatat setelah jadwal pickup terlewati.", code="pickup_time_not_passed")
-        if now >= reservation.resource_deadline:
+        if expiry_code(reservation, now) is not None:
             raise BusinessConflict("Deadline resource telah terlewati.", code="deadline_passed")
 
         before = audit_state(pickup)
@@ -365,12 +330,14 @@ def admin_pickups(request):
     query.is_valid(raise_exception=True)
     params = query.validated_data
 
-    queryset = Pickup.objects.select_related("reservation").all()
+    queryset = Pickup.objects.select_related("reservation__listing", "reservation__request").all()
+    now = utc_now()
+    queryset = with_effective_status(queryset, now, pickup=True)
     if "status" in params:
-        queryset = queryset.filter(status=params["status"])
+        queryset = queryset.filter(effective_status=params["status"])
     if "reservation_id" in params:
         queryset = queryset.filter(reservation_id=params["reservation_id"])
-    queryset = queryset.order_by("-scheduled_at", "-id")
+    queryset = queryset.select_related("reservation__listing", "reservation__request").order_by("-scheduled_at", "-id")
 
     paginator = PageNumberPagination()
     paginator.page_size = params.get("page_size", 20)
@@ -384,7 +351,7 @@ def admin_pickups(request):
             "count": paginator.page.paginator.count,
             "next": paginator.get_next_link(),
             "previous": paginator.get_previous_link(),
-            "results": PickupSerializer(page, many=True).data,
+            "results": PickupSerializer(page, many=True, context={"_expiry_now": now}).data,
         },
         "Daftar Pickup",
         status=200,
@@ -401,7 +368,7 @@ def admin_pickups_detail(request, pk):
         )
  
     if request.method == "GET":
-        pickup = Pickup.objects.select_related("reservation").filter(pk=pk).first()
+        pickup = Pickup.objects.select_related("reservation__listing", "reservation__request").filter(pk=pk).first()
         if pickup is None:
             raise NotFound()
  
@@ -425,7 +392,7 @@ def admin_pickups_detail(request, pk):
                     code="invalid_transition",
                 )
             now = timezone.now()
-            if now >= reservation.resource_deadline or pickup.scheduled_at >= reservation.resource_deadline:
+            if expiry_code(reservation, now) is not None or pickup.scheduled_at >= reservation.resource_deadline:
                 raise BusinessConflict("Deadline resource telah terlewati.", code="deadline_passed")
 
             data = serializer.validated_data
@@ -478,7 +445,7 @@ def admin_reservations_detail_pickup(request, pk):
                 "Nomor WhatsApp provider dan receiver wajib diisi.", code="contact_required"
             )
         now = timezone.now()
-        if now >= reservation.resource_deadline or scheduled_at >= reservation.resource_deadline:
+        if expiry_code(reservation, now) is not None or scheduled_at >= reservation.resource_deadline:
             raise BusinessConflict(
                 {"scheduled_at": "Jadwal harus lebih awal dari deadline resource."},
                 code="deadline_passed",
@@ -543,7 +510,7 @@ def admin_pickups_detail_complete(request, pk):
             )
 
         now = timezone.now()
-        if now >= reservation.resource_deadline:
+        if expiry_code(reservation, now) is not None:
             raise BusinessConflict("Deadline resource telah terlewati.", code="deadline_passed")
 
         before = {"status": pickup.status, "reservation_status": reservation.status}
@@ -597,7 +564,7 @@ def admin_pickups_detail_no_show(request, pk):
                 "No-show hanya dapat dicatat setelah jadwal pickup terlewati.",
                 code="pickup_time_not_passed",
             )
-        if now >= reservation.resource_deadline:
+        if expiry_code(reservation, now) is not None:
             raise BusinessConflict("Deadline resource telah terlewati.", code="deadline_passed")
 
         reason = serializer.validated_data["reason"]

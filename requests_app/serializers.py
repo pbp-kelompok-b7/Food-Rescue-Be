@@ -69,6 +69,7 @@ class RequestOwnerSerializer(serializers.Serializer):
 
 class ResourceRequestSerializer(serializers.ModelSerializer):
     owner = RequestOwnerSerializer(read_only=True)
+    status = serializers.CharField(source="effective_status", read_only=True)
     quantity_remaining = serializers.DecimalField(max_digits=15, decimal_places=3, read_only=True)
     quantity_allocated = serializers.DecimalField(max_digits=15, decimal_places=3, read_only=True)
     quantity_fulfilled = serializers.DecimalField(max_digits=15, decimal_places=3, read_only=True)

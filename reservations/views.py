@@ -8,6 +8,7 @@ from rest_framework.permissions import IsAdminUser, IsAuthenticated
 from common.serializers import validate_query_params
 from common.pagination import ContractPagination
 from shared.models import record_audit, audit_state
+from shared.services import with_effective_status, utc_now
 from common.responses import failure, success
 from listings.models import ResourceListing
 from requests_app.models import ResourceRequest
@@ -116,11 +117,13 @@ def reservations(request):
             raise ValidationError({"role": "Must be 'provider' or 'receiver'."})
         qs = qs.filter(provider=user) if role == "provider" else qs.filter(receiver=user)
 
+    now = utc_now()
+    qs = with_effective_status(qs, now)
     status_param = request.query_params.get("status")
     if status_param is not None:
         if status_param not in ReservationStatus.values:
             raise ValidationError({"status": "Unknown reservation status."})
-        qs = qs.filter(status=status_param)
+        qs = qs.filter(effective_status=status_param)
 
     source_type = request.query_params.get("source_type")
     if source_type is not None:
@@ -130,7 +133,7 @@ def reservations(request):
 
     paginator = ContractPagination()
     page = paginator.paginate_queryset(qs, request)
-    data = ReservationSerializer(page, many=True, context={"viewer": user}).data
+    data = ReservationSerializer(page, many=True, context={"viewer": user, "_expiry_now": now}).data
     return paginator.get_paginated_response(data)
 
 
@@ -339,11 +342,13 @@ def admin_reservations(request):
         .order_by("-created_at", "-id")
     )
 
+    now = utc_now()
+    qs = with_effective_status(qs, now)
     status_param = request.query_params.get("status")
     if status_param is not None:
         if status_param not in ReservationStatus.values:
             raise ValidationError({"status": "Unknown reservation status."})
-        qs = qs.filter(status=status_param)
+        qs = qs.filter(effective_status=status_param)
 
     source_type = request.query_params.get("source_type")
     if source_type is not None:
@@ -362,7 +367,7 @@ def admin_reservations(request):
 
     paginator = ContractPagination()
     page = paginator.paginate_queryset(qs, request)
-    data = AdminReservationSerializer(page, many=True).data
+    data = AdminReservationSerializer(page, many=True, context={"_expiry_now": now}).data
     return paginator.get_paginated_response(data)
 
 
