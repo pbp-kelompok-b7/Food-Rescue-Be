@@ -3,6 +3,7 @@ from django.db import models
 from django.db.models import Q, F
 from common.models import VersionedModel
 from shared.enums import ResourceType, Mode, Unit
+from common.photos import photo_path
 
 
 class ListingStatus(models.TextChoices):
@@ -20,6 +21,7 @@ class ResourceListing(VersionedModel):
     title = models.CharField(max_length=200)
     category = models.CharField(max_length=120)
     description = models.TextField()
+    image = models.ImageField(upload_to=photo_path, blank=True, null=True)
     quantity_total = models.DecimalField(max_digits=15, decimal_places=3)
     unit = models.CharField(max_length=8, choices=Unit.choices)
     mode = models.CharField(max_length=6, choices=Mode.choices)

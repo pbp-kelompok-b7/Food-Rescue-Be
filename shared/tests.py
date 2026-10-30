@@ -319,3 +319,25 @@ class LocationConcurrencyTests(TransactionTestCase):
     def test_concurrent_same_query_is_cached_once_for_all_clients(self):
         self.assertEqual(self.race(["Universitas Indonesia"] * 5), [200] * 5)
         self.assertEqual(LocationSearchCache.objects.count(), 1)
+
+
+class PhotonSearchTests(SimpleTestCase):
+    def test_partial_search_normalizes_geojson_and_sends_photon_parameters(self):
+        from shared.services import _fetch_locations
+        payload = {"type": "FeatureCollection", "features": [{"type": "Feature",
+            "geometry": {"type": "Point", "coordinates": [106.818, -6.366]},
+            "properties": {"name": "Kukusan", "city": "Depok", "state": "West Java", "country": "Indonesia"}}]}
+        with patch("shared.services.requests.get", return_value=provider_response(payload)) as fetch:
+            result = _fetch_locations("https://photon.komoot.io/api/", "FoodRescue/test", "Kukus", 5, 5)
+        self.assertEqual(result[0]["area"], "Depok")
+        self.assertEqual(result[0]["latitude"], -6.366)
+        self.assertEqual(result[0]["longitude"], 106.818)
+        self.assertIn("Kukusan", result[0]["label"])
+        self.assertEqual(fetch.call_args.kwargs["params"]["q"], "Kukus")
+        self.assertNotIn("format", fetch.call_args.kwargs["params"])
+
+    def test_malformed_photon_geometry_is_rejected(self):
+        from shared.services import _normalize_results, LocationProviderError
+        for geometry in ({"type": "Point", "coordinates": [106]}, {"type": "Polygon", "coordinates": []}):
+            with self.assertRaises(LocationProviderError):
+                _normalize_results({"type": "FeatureCollection", "features": [{"geometry": geometry, "properties": {"name": "Test"}}]}, 5)

@@ -3,6 +3,7 @@ from django.db import models
 from django.db.models import Q, F
 from common.models import VersionedModel
 from shared.enums import ResourceType, Mode, Unit
+from common.photos import photo_path
 
 
 class RequestStatus(models.TextChoices):
@@ -18,6 +19,7 @@ class ResourceRequest(VersionedModel):
     created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="created_requests")
     title = models.CharField(max_length=160)
     description = models.TextField(blank=True)
+    image = models.ImageField(upload_to=photo_path, blank=True, null=True)
     resource_type = models.CharField(max_length=32, choices=ResourceType.choices)
     category = models.CharField(max_length=120)
     intended_use = models.CharField(max_length=32)

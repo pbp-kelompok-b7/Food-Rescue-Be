@@ -270,7 +270,7 @@ class RequestReadTests(TestCase):
 
     def test_contract_fields_never_expose_contacts_or_internal_creator(self):
         source = self.make_request()
-        expected = {"id", "created_at", "updated_at", "version", "resource_type", "category", "intended_use",
+        expected = {"image", "id", "created_at", "updated_at", "version", "resource_type", "category", "intended_use",
                     "quantity_needed", "unit", "location", "donate_only", "max_unit_price", "valid_until",
                     "owner", "status", "quantity_remaining", "quantity_allocated", "quantity_fulfilled", "archived_at"}
         for user in (None, self.owner, self.admin):

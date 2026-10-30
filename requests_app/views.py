@@ -7,6 +7,7 @@ from django.utils import timezone
 from django.views.decorators.cache import never_cache
 from rest_framework.decorators import api_view, parser_classes, permission_classes
 from rest_framework.parsers import JSONParser
+from common.photos import ResourceMultipartParser
 from rest_framework.exceptions import NotAuthenticated, NotFound, PermissionDenied, ValidationError
 from rest_framework.permissions import IsAdminUser, IsAuthenticated, IsAuthenticatedOrReadOnly
 
@@ -287,7 +288,7 @@ def delete_request(request, pk):
 @never_cache
 @api_view(['GET', 'POST'])
 @permission_classes([IsAuthenticatedOrReadOnly])
-@parser_classes([JSONParser])
+@parser_classes([JSONParser, ResourceMultipartParser])
 def requests(request):
     if request.method == "GET":
         return browse_requests(request)
@@ -299,7 +300,7 @@ def requests(request):
 @never_cache
 @api_view(['GET', 'PATCH', 'DELETE'])
 @permission_classes([IsAuthenticatedOrReadOnly])
-@parser_classes([JSONParser])
+@parser_classes([JSONParser, ResourceMultipartParser])
 def requests_detail(request, pk):
     if request.method == "GET":
         return request_detail(request, pk)

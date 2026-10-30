@@ -125,11 +125,15 @@ EXPIRY_INTERVAL_SECONDS = env.float("EXPIRY_INTERVAL_SECONDS", default=60)
 
 # Manual, user-triggered lookups only; provider traffic is gated in PostgreSQL.
 LOCATION_SEARCH_ENABLED = env.bool("LOCATION_SEARCH_ENABLED", default=True)
-LOCATION_SEARCH_URL = env("LOCATION_SEARCH_URL", default="https://nominatim.openstreetmap.org/search")
+LOCATION_SEARCH_URL = env("LOCATION_SEARCH_URL", default="https://photon.komoot.io/api/")
 LOCATION_SEARCH_USER_AGENT = env(
     "LOCATION_SEARCH_USER_AGENT",
     default="FoodRescue/1.0 (+https://github.com/pbp-kelompok-b7/Food-Rescue-Be)",
 )
-LOCATION_SEARCH_TIMEOUT = env.float("LOCATION_SEARCH_TIMEOUT", default=5.0)
+LOCATION_SEARCH_TIMEOUT = env.float("LOCATION_SEARCH_TIMEOUT", default=10.0)
 LOCATION_SEARCH_CACHE_TTL = env.int("LOCATION_SEARCH_CACHE_TTL", default=86400)
 LOCATION_SEARCH_MIN_INTERVAL = env.float("LOCATION_SEARCH_MIN_INTERVAL", default=1.0)
+
+# Use a persistent volume or configure Django's default storage in production.
+MEDIA_ROOT = env("MEDIA_ROOT", default=str(BASE_DIR / "media"))
+MEDIA_URL = "/api/v1/media/"

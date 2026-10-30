@@ -10,6 +10,7 @@ from common.serializers import DecimalStringField, RFC3339DateTimeField
 from common.exceptions import BusinessConflict
 from shared.enums import ResourceType, Suitability, Unit
 from shared.reference_data import CATEGORY_RESOURCE_TYPES
+from common.photos import PhotoField
 from .models import ResourceRequest, RequestStatus
 
 
@@ -67,7 +68,7 @@ class ResourceRequestSerializer(serializers.ModelSerializer):
     class Meta:
         model = ResourceRequest
         fields = (
-            "id", "created_at", "updated_at", "version", "resource_type", "category",
+            "id", "created_at", "updated_at", "version", "image", "resource_type", "category",
             "intended_use", "quantity_needed", "unit", "location", "donate_only",
             "max_unit_price", "valid_until", "owner", "status", "quantity_remaining",
             "quantity_allocated", "quantity_fulfilled", "archived_at",
@@ -119,6 +120,7 @@ class RequestLocationSerializer(StrictObjectSerializer):
 
 
 class RequestWriteSerializer(StrictObjectSerializer):
+    image = PhotoField()
     resource_type = serializers.ChoiceField(choices=ResourceType.values)
     category = serializers.ChoiceField(choices=tuple(CATEGORY_RESOURCE_TYPES))
     intended_use = serializers.ChoiceField(choices=Suitability.values)
