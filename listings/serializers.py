@@ -9,6 +9,7 @@ from common.serializers import StrictSerializer
 from .models import ResourceListing, ListingStatus
 from shared.enums import ResourceType, Suitability, Mode, Unit
 from shared.reference_data import CATEGORIES
+from common.photos import PhotoField
 
 
 class ListingLocationSerializer(StrictSerializer):
@@ -39,6 +40,7 @@ class ListingOwnerSerializer(serializers.Serializer):
 
 
 class ListingSerializer(StrictSerializer, serializers.ModelSerializer):
+    image = PhotoField()
     owner = ListingOwnerSerializer(read_only=True)
     status = serializers.CharField(source='effective_status', read_only=True)
     quantity_available = serializers.DecimalField(max_digits=15, decimal_places=3, read_only=True)
@@ -67,7 +69,7 @@ class ListingSerializer(StrictSerializer, serializers.ModelSerializer):
         fields = [
             'id', 'created_at', 'updated_at', 'version',
             'owner', 'resource_type', 'title', 'category',
-            'description', 'quantity_total', 'unit', 'mode', 'unit_price',
+            'description', 'image', 'quantity_total', 'unit', 'mode', 'unit_price',
             'condition', 'suitability', 'location', 'available_until',
             'storage_notes', 'allergen_notes', 'packaging_status', 'status', 'archived_at',
             'quantity_available', 'quantity_allocated', 'quantity_completed',

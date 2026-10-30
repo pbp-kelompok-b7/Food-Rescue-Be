@@ -26,6 +26,7 @@ class SupplyListingReadTests(TestCase):
     url = "/api/v1/listings/"
     now = datetime(2026, 10, 27, 5, 0, tzinfo=dt_timezone.utc)
     response_fields = {
+        'image',
         "id", "created_at", "updated_at", "version", "resource_type", "title",
         "category", "description", "unit", "mode", "unit_price", "condition",
         "suitability", "location", "storage_notes", "allergen_notes",

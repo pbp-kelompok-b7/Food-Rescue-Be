@@ -7,3 +7,4 @@ django-environ>=0.12,<1.0
 gunicorn
 google-auth[requests]>=2.0,<3.0
 requests>=2.32.5,<3.0
+Pillow>=12.0,<13.0
