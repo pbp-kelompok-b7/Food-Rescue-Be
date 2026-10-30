@@ -1,4 +1,5 @@
 from functools import partial
+import logging
 
 from django.conf import settings
 from django.contrib.auth import login, logout, authenticate
@@ -19,6 +20,23 @@ from django.middleware.csrf import get_token
 from .models import User
 from .serializers import GoogleLoginSerializer, UserSelfSerializer, LoginSerializer, LogoutSerializer, RegisterSerializer, ProfileSerializer
 from .throttles import GoogleLoginThrottle, LoginThrottle
+
+logger = logging.getLogger(__name__)
+
+
+def google_verification_reason(error):
+    # Exception text can contain credentials. Log only fixed categories.
+    message = str(error).lower()
+    for marker, reason in (
+        ("audience", "audience_mismatch"),
+        ("used too early", "token_used_too_early"),
+        ("expired", "token_expired"),
+        ("issuer", "invalid_issuer"),
+        ("signature", "invalid_signature"),
+    ):
+        if marker in message:
+            return reason
+    return "invalid_token"
 
 
 def session_response(user):
@@ -138,8 +156,12 @@ def auth_google(request):
             serializer.validated_data["credential"],
             partial(GoogleRequest(), timeout=10),
             audience=settings.GOOGLE_CLIENT_ID,
+            # PWS can lag Google's clock by a few seconds. Keep time checks
+            # enabled while allowing a small, bounded clock difference.
+            clock_skew_in_seconds=30,
         )
-    except ValueError:
+    except ValueError as error:
+        logger.warning("Google sign-in rejected: %s", google_verification_reason(error))
         return google_login_error("invalid_credentials", "Kredensial tidak valid.", 401)
     except GoogleAuthError:
         return google_login_error("google_unavailable", "Google Sign-In sementara tidak tersedia.", 503)
@@ -147,6 +169,7 @@ def auth_google(request):
     subject = claims.get("sub")
     if (not isinstance(subject, str) or not subject or len(subject) > 255
             or claims.get("email_verified") is not True):
+        logger.warning("Google sign-in rejected: invalid_subject_or_unverified_email")
         return google_login_error("invalid_credentials", "Kredensial tidak valid.", 401)
 
     user = User.objects.filter(google_sub=subject).first()
@@ -158,6 +181,7 @@ def auth_google(request):
                 raise ValidationError("Invalid email.")
             validate_email(email)
         except ValidationError:
+            logger.warning("Google sign-in rejected: invalid_email")
             return google_login_error("invalid_credentials", "Kredensial tidak valid.", 401)
         email = email.lower()
         if User.objects.filter(email__iexact=email).exists():
@@ -181,6 +205,7 @@ def auth_google(request):
                 return google_login_error("account_link_required", "Email sudah terdaftar. Masuk dengan metode akun yang sudah ada.", 409)
 
     if not user.is_active:
+        logger.warning("Google sign-in rejected: inactive_account")
         return google_login_error("invalid_credentials", "Kredensial tidak valid.", 401)
     login(request, user, backend="django.contrib.auth.backends.ModelBackend")
     return session_response(user)
