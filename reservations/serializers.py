@@ -9,12 +9,14 @@ from rest_framework.exceptions import PermissionDenied
 from rest_framework.renderers import JSONRenderer
 
 from common.exceptions import BusinessConflict
+from common.serializers import StrictSerializer, DecimalStringField, RFC3339DateTimeField, CoordinateField, StringField
 from listings.models import ListingStatus
 from pickups.models import PickupStatus
 from pickups.serializers import PickupSerializer
 from requests_app.models import RequestStatus
 from shared.enums import Mode, ResourceType, Suitability, Unit
 from .models import Reservation, ReservationStatus, SourceType
+from shared.services import source_quantities, expiry_code, effective_reservation_status, utc_now, recalculate_source, expiry_reason, effective_source_status
 
 
 # Units that may only be claimed in whole-number quantities. ``kg`` allows
@@ -32,22 +34,8 @@ def _decimal_str(value, places):
     return str(Decimal(value).quantize(quantum))
 
 
-class StrictFieldsMixin:
-    """Reject unknown / read-only fields with 400 (contract section 7.0).
-
-    The contract states requests must not send server-owned or unknown fields;
-    doing so is a validation error rather than silently ignored.
-    """
-
-    def to_internal_value(self, data):
-        if isinstance(data, dict):
-            allowed = set(self.fields)
-            unknown = [key for key in data if key not in allowed]
-            if unknown:
-                raise serializers.ValidationError(
-                    {key: ["Unknown or read-only field."] for key in sorted(unknown)}
-                )
-        return super().to_internal_value(data)
+class StrictFieldsMixin(StrictSerializer):
+    """Shared unknown/read-only-field validation."""
 
 
 class UserRefSerializer(serializers.Serializer):
@@ -57,7 +45,7 @@ class UserRefSerializer(serializers.Serializer):
     display_name = serializers.CharField()
 
 
-class LocationSerializer(serializers.Serializer):
+class LocationSerializer(StrictSerializer):
     """Resource location per the contract (sections 7.2.2 / 7.4.2).
 
     ``label`` 1-300, ``area`` 1-100, ``latitude`` -90..90, ``longitude``
@@ -66,8 +54,8 @@ class LocationSerializer(serializers.Serializer):
 
     label = serializers.CharField(max_length=300, min_length=1)
     area = serializers.CharField(max_length=100, min_length=1)
-    latitude = serializers.FloatField(min_value=-90, max_value=90)
-    longitude = serializers.FloatField(min_value=-180, max_value=180)
+    latitude = CoordinateField(min_value=-90, max_value=90)
+    longitude = CoordinateField(min_value=-180, max_value=180)
 
 
 class ReservationSerializer(serializers.Serializer):
@@ -90,7 +78,7 @@ class ReservationSerializer(serializers.Serializer):
     provider = UserRefSerializer()
     receiver = UserRefSerializer()
     submitted_by_id = serializers.IntegerField()
-    status = serializers.CharField()
+    status = serializers.SerializerMethodField()
     terms = serializers.SerializerMethodField()
     accepted_snapshot = serializers.JSONField()
     accepted_at = serializers.DateTimeField(allow_null=True)
@@ -98,6 +86,12 @@ class ReservationSerializer(serializers.Serializer):
     cancellation_code = serializers.SerializerMethodField()
     pickup = serializers.SerializerMethodField()
     counterparty_contact = serializers.SerializerMethodField()
+
+    def _expiry_now(self):
+        return self.context.setdefault("_expiry_now", utc_now())
+
+    def get_status(self, obj):
+        return effective_reservation_status(obj, self._expiry_now())
 
     def get_terms(self, obj):
         # For a listing claim the resource detail is taken from the listing at
@@ -118,7 +112,7 @@ class ReservationSerializer(serializers.Serializer):
                 "packaging_status": listing.packaging_status,
             }
         else:
-            terms = dict(obj.resource_data or {})
+            terms = {key: value for key, value in (obj.resource_data or {}).items() if key in OFFER_RESOURCE_KEYS}
         terms.update(
             {
                 "quantity": _decimal_str(obj.quantity, 3),
@@ -132,10 +126,11 @@ class ReservationSerializer(serializers.Serializer):
         return terms
 
     def get_reason(self, obj):
-        return obj.reason or None
+        code = expiry_code(obj, self._expiry_now())
+        return expiry_reason(code) if code else obj.reason or None
 
     def get_cancellation_code(self, obj):
-        return obj.cancellation_code or None
+        return expiry_code(obj, self._expiry_now()) or obj.cancellation_code or None
 
     def get_pickup(self, obj):
         # A reservation has at most one pickup (section 7.5). Render it when it
@@ -145,7 +140,7 @@ class ReservationSerializer(serializers.Serializer):
             return None
         # Reuse the pickups app serializer so the nested pickup shape stays in
         # one place (section 7.5).
-        return PickupSerializer(pickup).data
+        return PickupSerializer(pickup, context=self.context).data
 
     def get_counterparty_contact(self, obj):
         """Contact of the transaction partner, relative to the viewer.
@@ -157,7 +152,7 @@ class ReservationSerializer(serializers.Serializer):
         contacts, so admin moderation uses the admin detail endpoint instead.
         """
         viewer = self.context.get("viewer")
-        if viewer is None or obj.status != ReservationStatus.ACCEPTED:
+        if viewer is None or self.get_status(obj) != ReservationStatus.ACCEPTED:
             return None
 
         if viewer.id == obj.provider_id:
@@ -215,7 +210,7 @@ class ListingClaimCreateSerializer(StrictFieldsMixin, serializers.Serializer):
     cannot forge price/owner/status.
     """
 
-    quantity = serializers.DecimalField(max_digits=15, decimal_places=3)
+    quantity = DecimalStringField(max_digits=15, decimal_places=3)
 
     def __init__(self, *args, listing=None, user=None, **kwargs):
         self.listing = listing
@@ -245,7 +240,8 @@ class ListingClaimCreateSerializer(StrictFieldsMixin, serializers.Serializer):
         # Source must be AVAILABLE and not past its deadline. The contract uses
         # a single ``source_not_accepting`` code for both conditions.
         if (
-            listing.status != ListingStatus.AVAILABLE
+            (listing.status != ListingStatus.AVAILABLE
+             and effective_source_status(listing) != ListingStatus.AVAILABLE)
             or listing.available_until <= timezone.now()
         ):
             raise BusinessConflict(
@@ -254,10 +250,7 @@ class ListingClaimCreateSerializer(StrictFieldsMixin, serializers.Serializer):
 
         # Requested quantity must not exceed the available quantity at create
         # time. PENDING claims do not allocate stock; only ACCEPTED do.
-        allocated = listing.reservations.filter(
-            status__in=ACTIVE_ALLOCATION_STATUSES
-        ).aggregate(total=Sum("quantity"))["total"] or Decimal("0")
-        available = listing.quantity_total - allocated
+        available = source_quantities(listing)["remaining"]
         if attrs["quantity"] > available:
             raise BusinessConflict(
                 f"Requested quantity exceeds the available quantity ({available}).",
@@ -320,7 +313,7 @@ class RequestOfferCreateSerializer(StrictFieldsMixin, serializers.Serializer):
     description = serializers.CharField(max_length=5000)
     unit = serializers.ChoiceField(choices=Unit.choices)
     mode = serializers.ChoiceField(choices=Mode.choices)
-    unit_price = serializers.DecimalField(max_digits=15, decimal_places=2, min_value=Decimal("0"))
+    unit_price = DecimalStringField(max_digits=15, decimal_places=2, min_value=Decimal("0"))
     condition = serializers.CharField(max_length=1000)
     suitability = serializers.ListField(
         child=serializers.ChoiceField(choices=Suitability.choices), allow_empty=False
@@ -329,8 +322,8 @@ class RequestOfferCreateSerializer(StrictFieldsMixin, serializers.Serializer):
     storage_notes = serializers.CharField(max_length=2000, required=False, allow_null=True, default=None)
     allergen_notes = serializers.CharField(max_length=2000, required=False, allow_null=True, default=None)
     packaging_status = serializers.CharField(max_length=200, required=False, allow_null=True, default=None)
-    quantity = serializers.DecimalField(max_digits=15, decimal_places=3)
-    resource_deadline = serializers.DateTimeField()
+    quantity = DecimalStringField(max_digits=15, decimal_places=3)
+    resource_deadline = RFC3339DateTimeField()
 
     def __init__(self, *args, request_obj=None, user=None, **kwargs):
         self.request_obj = request_obj
@@ -368,7 +361,8 @@ class RequestOfferCreateSerializer(StrictFieldsMixin, serializers.Serializer):
             )
 
         # Source must be OPEN and not past its valid_until.
-        if req.status != RequestStatus.OPEN or req.valid_until <= timezone.now():
+        if ((req.status != RequestStatus.OPEN and effective_source_status(req) != RequestStatus.OPEN)
+                or req.valid_until <= timezone.now()):
             raise BusinessConflict(
                 "This request is not accepting offers.", code="source_not_accepting"
             )
@@ -420,10 +414,7 @@ class RequestOfferCreateSerializer(StrictFieldsMixin, serializers.Serializer):
 
         # Requested quantity must not exceed the remaining need at create time.
         # PENDING offers do not allocate; only ACCEPTED reservations do.
-        allocated = req.reservations.filter(
-            status__in=ACTIVE_ALLOCATION_STATUSES
-        ).aggregate(total=Sum("quantity"))["total"] or Decimal("0")
-        remaining = req.quantity_needed - allocated
+        remaining = source_quantities(req)["remaining"]
         if attrs["quantity"] > remaining:
             raise BusinessConflict(
                 f"Offer quantity exceeds the remaining need ({remaining}).",
@@ -464,9 +455,9 @@ class ReservationReviseSerializer(StrictFieldsMixin, serializers.Serializer):
     reallocated.
     """
 
-    quantity = serializers.DecimalField(max_digits=15, decimal_places=3, required=False)
+    quantity = DecimalStringField(max_digits=15, decimal_places=3, required=False)
     expected_version = serializers.IntegerField()
-    reason = serializers.CharField(min_length=1, max_length=1000, required=False)
+    reason = StringField(min_length=1, max_length=1000, required=False)
 
     def __init__(self, *args, reservation=None, user=None, is_admin=False, **kwargs):
         self.reservation = reservation
@@ -492,7 +483,7 @@ class ReservationReviseSerializer(StrictFieldsMixin, serializers.Serializer):
             raise serializers.ValidationError({"reason": "This field is required."})
 
         # Only PENDING submissions can be revised.
-        if reservation.status != ReservationStatus.PENDING:
+        if effective_reservation_status(reservation) != ReservationStatus.PENDING:
             raise BusinessConflict(
                 "Only a pending reservation can be revised.", code="invalid_transition"
             )
@@ -520,10 +511,7 @@ class ReservationReviseSerializer(StrictFieldsMixin, serializers.Serializer):
             source = reservation.request
             total = source.quantity_needed
             label = "remaining"
-        allocated = source.reservations.filter(
-            status__in=ACTIVE_ALLOCATION_STATUSES
-        ).aggregate(total=Sum("quantity"))["total"] or Decimal("0")
-        headroom = total - allocated
+        headroom = source_quantities(source)["remaining"]
         if new_quantity > headroom:
             raise BusinessConflict(
                 f"Revised quantity exceeds the {label} quantity ({headroom}).",
@@ -597,7 +585,7 @@ class ReservationAcceptSerializer(StrictFieldsMixin, serializers.Serializer):
     """
 
     expected_version = serializers.IntegerField()
-    reason = serializers.CharField(min_length=1, max_length=1000, required=False)
+    reason = StringField(min_length=1, max_length=1000, required=False)
 
     def __init__(self, *args, reservation=None, user=None, source_obj=None, is_admin=False, **kwargs):
         # NOTE: ``source`` is reserved by DRF's Field/Serializer machinery, so
@@ -649,7 +637,8 @@ class ReservationAcceptSerializer(StrictFieldsMixin, serializers.Serializer):
         now = timezone.now()
         if reservation.source_type == SourceType.LISTING_CLAIM:
             # Source must still be AVAILABLE and before its deadline.
-            if source.status != ListingStatus.AVAILABLE:
+            if (source.status != ListingStatus.AVAILABLE
+                    and effective_source_status(source, now) != ListingStatus.AVAILABLE):
                 raise BusinessConflict(
                     "The listing is no longer accepting claims.",
                     code="source_not_accepting",
@@ -660,7 +649,8 @@ class ReservationAcceptSerializer(StrictFieldsMixin, serializers.Serializer):
                 )
             total = source.quantity_total
         else:
-            if source.status != RequestStatus.OPEN:
+            if (source.status != RequestStatus.OPEN
+                    and effective_source_status(source, now) != RequestStatus.OPEN):
                 raise BusinessConflict(
                     "The request is no longer accepting offers.",
                     code="source_not_accepting",
@@ -684,10 +674,8 @@ class ReservationAcceptSerializer(StrictFieldsMixin, serializers.Serializer):
 
         # Availability re-check excluding this reservation. Only ACCEPTED
         # reservations hold allocation; this one is still PENDING.
-        allocated = source.reservations.filter(
-            status=ReservationStatus.ACCEPTED
-        ).aggregate(total=Sum("quantity"))["total"] or Decimal("0")
-        available = total - allocated
+        totals = source_quantities(source, now)
+        available = totals["remaining"]
         if reservation.quantity > available:
             raise BusinessConflict(
                 f"Not enough quantity remains to accept this reservation ({available}).",
@@ -695,7 +683,7 @@ class ReservationAcceptSerializer(StrictFieldsMixin, serializers.Serializer):
             )
 
         attrs["_total"] = total
-        attrs["_allocated_after"] = allocated + reservation.quantity
+        attrs["_allocated_after"] = totals["allocated"] + totals["completed"] + reservation.quantity
         attrs["_now"] = now
         # For a claim the resource deadline is owned by the listing, which may
         # have been edited since the claim was submitted. Re-sync it from the
@@ -740,15 +728,7 @@ class ReservationAcceptSerializer(StrictFieldsMixin, serializers.Serializer):
 
         # Recompute source status now that this reservation is ACCEPTED and
         # therefore counts toward allocation. Full allocation flips the status.
-        fully_allocated = self.validated_data["_allocated_after"] >= self.validated_data["_total"]
-        if reservation.source_type == SourceType.LISTING_CLAIM:
-            if fully_allocated and source.status == ListingStatus.AVAILABLE:
-                source.status = ListingStatus.RESERVED
-                source.save(update_fields=["status", "updated_at"])
-        else:
-            if fully_allocated and source.status == RequestStatus.OPEN:
-                source.status = RequestStatus.ALLOCATED
-                source.save(update_fields=["status", "updated_at"])
+        recalculate_source(source, now)
 
         return reservation
 
@@ -761,7 +741,7 @@ class ReservationRejectSerializer(StrictFieldsMixin, serializers.Serializer):
     409 ``stale_version``). REJECTED is terminal and does not change quantity.
     """
 
-    reason = serializers.CharField(min_length=1, max_length=1000)
+    reason = StringField(min_length=1, max_length=1000)
     expected_version = serializers.IntegerField()
 
     def __init__(self, *args, reservation=None, user=None, is_admin=False, **kwargs):
@@ -774,7 +754,7 @@ class ReservationRejectSerializer(StrictFieldsMixin, serializers.Serializer):
         reservation = self.reservation
         user = self.user
 
-        if reservation.status != ReservationStatus.PENDING:
+        if effective_reservation_status(reservation) != ReservationStatus.PENDING:
             raise BusinessConflict(
                 "Only a pending reservation can be rejected.",
                 code="invalid_transition",
@@ -828,7 +808,7 @@ class ReservationCancelSerializer(StrictFieldsMixin, serializers.Serializer):
     reservation).
     """
 
-    reason = serializers.CharField(min_length=1, max_length=1000)
+    reason = StringField(min_length=1, max_length=1000)
 
     def __init__(self, *args, reservation=None, user=None, source_obj=None, **kwargs):
         self.reservation = reservation
@@ -896,13 +876,6 @@ class ReservationCancelSerializer(StrictFieldsMixin, serializers.Serializer):
         # ACCEPTED, so it stops counting toward the source's allocation. Recompute
         # and reopen the source only if it is still active and before its deadline.
         if was_accepted:
-            if reservation.source_type == SourceType.LISTING_CLAIM:
-                if source.status == ListingStatus.RESERVED and source.available_until > now:
-                    source.status = ListingStatus.AVAILABLE
-                    source.save(update_fields=["status", "updated_at"])
-            else:
-                if source.status == RequestStatus.ALLOCATED and source.valid_until > now:
-                    source.status = RequestStatus.OPEN
-                    source.save(update_fields=["status", "updated_at"])
+            recalculate_source(source, now)
 
         return reservation

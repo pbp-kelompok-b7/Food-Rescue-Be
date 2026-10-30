@@ -14,7 +14,7 @@ from common.exceptions import BusinessConflict
 from common.serializers import StrictSerializer
 from pickups.models import Pickup
 from reservations.models import ReservationStatus
-from shared.models import AuditEvent
+from shared.models import AuditEvent, record_audit, audit_state
 from .models import ListingStatus, ResourceListing
 from .queries import listings_with_state
 from .serializers import ListingCloseSerializer, ListingSerializer
@@ -58,7 +58,7 @@ def _summary(listing):
 
 
 def _audit(actor, listing_id, action, before, after, **extra):
-    AuditEvent.objects.create(
+    record_audit(
         actor=actor, entity_type='ResourceListing', entity_id=str(listing_id), action=action,
         summary={'before': before, 'after': after, **extra},
     )
@@ -75,7 +75,7 @@ def _cancel_pending(reservations, actor, reason, now):
         reservation.version += 1
         reservation.updated_at = now
         reservation.save(update_fields=('status', 'cancellation_code', 'reason', 'version', 'updated_at'))
-        AuditEvent.objects.create(
+        record_audit(
             actor=actor, entity_type='Reservation', entity_id=str(reservation.pk),
             action='source_closed', summary={
                 'listing_id': reservation.listing_id, 'before_status': ReservationStatus.PENDING,

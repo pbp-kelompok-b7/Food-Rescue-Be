@@ -5,21 +5,12 @@ from decimal import Decimal
 
 from django.utils import timezone
 from rest_framework import serializers
+from common.serializers import DecimalStringField, RFC3339DateTimeField
 
 from common.exceptions import BusinessConflict
 from shared.enums import ResourceType, Suitability, Unit
+from shared.reference_data import CATEGORY_RESOURCE_TYPES
 from .models import ResourceRequest, RequestStatus
-
-
-# Proposed seed vocabulary from Technical Design Revision 2, section 7.6.1.
-CATEGORY_RESOURCE_TYPES = {
-    "prepared_meal": ResourceType.PACKAGED_FOOD_SURPLUS,
-    "bakery": ResourceType.PACKAGED_FOOD_SURPLUS,
-    "snack": ResourceType.PACKAGED_FOOD_SURPLUS,
-    "coffee_grounds": ResourceType.COMPOSTABLE_FOOD_WASTE,
-    "fruit_vegetable_scraps": ResourceType.COMPOSTABLE_FOOD_WASTE,
-    "eggshells": ResourceType.COMPOSTABLE_FOOD_WASTE,
-}
 
 
 class RequestQuerySerializer(serializers.Serializer):
@@ -68,6 +59,7 @@ class RequestOwnerSerializer(serializers.Serializer):
 
 class ResourceRequestSerializer(serializers.ModelSerializer):
     owner = RequestOwnerSerializer(read_only=True)
+    status = serializers.CharField(source="effective_status", read_only=True)
     quantity_remaining = serializers.DecimalField(max_digits=15, decimal_places=3, read_only=True)
     quantity_allocated = serializers.DecimalField(max_digits=15, decimal_places=3, read_only=True)
     quantity_fulfilled = serializers.DecimalField(max_digits=15, decimal_places=3, read_only=True)
@@ -90,13 +82,6 @@ class StrictObjectSerializer(serializers.Serializer):
         unknown = set(data) - set(self.fields)
         if unknown:
             raise serializers.ValidationError({key: "Unknown or read-only field." for key in sorted(unknown)})
-        return super().to_internal_value(data)
-
-
-class DecimalStringField(serializers.DecimalField):
-    def to_internal_value(self, data):
-        if not isinstance(data, str) or not re.fullmatch(r"-?[0-9]+(?:\.[0-9]+)?", data):
-            raise serializers.ValidationError("Expected a decimal string.")
         return super().to_internal_value(data)
 
 
@@ -143,7 +128,7 @@ class RequestWriteSerializer(StrictObjectSerializer):
     donate_only = serializers.BooleanField(default=False)
     max_unit_price = DecimalStringField(max_digits=15, decimal_places=2, min_value=Decimal("0"),
                                        allow_null=True, default=None)
-    valid_until = serializers.DateTimeField()
+    valid_until = RFC3339DateTimeField()
 
     def validate_donate_only(self, value):
         if type(self.initial_data.get("donate_only", False)) is not bool:

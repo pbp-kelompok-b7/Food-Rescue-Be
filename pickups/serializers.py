@@ -4,6 +4,8 @@ from django.utils import timezone
 from rest_framework import serializers
 from rest_framework.exceptions import ErrorDetail
 from .models import Pickup
+from shared.services import expiry_code, utc_now
+from common.serializers import RFC3339DateTimeField, validate_query_params
 
 RFC3339 = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$")
 
@@ -15,6 +17,13 @@ class PickupSerializer(serializers.ModelSerializer):
     no_show_at = serializers.DateTimeField(default_timezone=dt_timezone.utc, read_only=True)
     cancelled_at = serializers.DateTimeField(default_timezone=dt_timezone.utc, read_only=True)
     reservation_id = serializers.IntegerField(read_only=True)
+    status = serializers.SerializerMethodField()
+
+    def get_status(self, obj):
+        now = self.context.setdefault("_expiry_now", utc_now())
+        if obj.status == "SCHEDULED" and expiry_code(obj.reservation, now, pickup=obj):
+            return "CANCELLED"
+        return obj.status
     
     class Meta:
         model = Pickup
@@ -29,6 +38,9 @@ class StrictFieldsSerializer(serializers.Serializer):
     unknown_field_messages = {}
 
     def to_internal_value(self, data):
+        if hasattr(data, "getlist"):
+            validate_query_params(data, set(self.fields))
+            data = {key: data[key] for key in data}
         if isinstance(data, dict):
             unknown = set(data) - set(self.fields)
             if unknown:
@@ -50,7 +62,7 @@ class AdminFieldsSerializerWithReason(StrictFieldsSerializer):
         return value
     
 class PickupScheduleSerializer(StrictFieldsSerializer):
-    scheduled_at = serializers.DateTimeField()
+    scheduled_at = RFC3339DateTimeField()
     instructions = serializers.CharField(
         max_length=2000, allow_null=True, allow_blank=True, required=False, default=None
     )

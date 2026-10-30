@@ -6,29 +6,23 @@ from django.db.models.functions import Coalesce
 from pickups.models import PickupStatus
 from reservations.models import ReservationStatus
 from .models import ListingStatus, ResourceListing
+from shared.services import allocated_filter, completed_filter
 
 
 def listings_with_state(now):
     """Read effective quantities/status even before the expiry worker has run.
 
-    Lifecycle writes and reservation/pickup cancellation belong to SF-BE-04.
+    Lifecycle writes and reservation/pickup cancellation belong to SF-BE-06.
     Completed quantities remain counted after the resource deadline.
     """
     quantity_field = DecimalField(max_digits=15, decimal_places=3)
     zero = Value(Decimal('0.000'), output_field=quantity_field)
-    accepted = Q(reservations__status=ReservationStatus.ACCEPTED)
-    completed = Q(reservations__pickup__status=PickupStatus.COMPLETED)
-    allocated = (
-        accepted
-        & ~Q(status=ListingStatus.EXPIRED)
-        & Q(available_until__gt=now, reservations__resource_deadline__gt=now)
-        & (Q(reservations__pickup__isnull=True)
-           | Q(reservations__pickup__status=PickupStatus.SCHEDULED))
-    )
+    allocated = allocated_filter(now, "reservations__")
+    completed = completed_filter("reservations__")
 
     return ResourceListing.objects.select_related('owner').annotate(
         quantity_completed=Coalesce(
-            Sum('reservations__quantity', filter=accepted & completed),
+            Sum('reservations__quantity', filter=completed),
             zero, output_field=quantity_field,
         ),
         quantity_allocated=Coalesce(

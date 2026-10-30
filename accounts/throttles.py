@@ -1,20 +1,9 @@
-from rest_framework.throttling import SimpleRateThrottle
+from common.authentication import SharedRateThrottle
 
 
-class GoogleLoginThrottle(SimpleRateThrottle):
+class GoogleLoginThrottle(SharedRateThrottle):
     scope = "google_login"
-    rate = "10/min"
-
-    def get_cache_key(self, request, view):
-        return self.cache_format % {"scope": self.scope, "ident": self.get_ident(request)}
 
 
-class LoginThrottle(SimpleRateThrottle):
+class LoginThrottle(SharedRateThrottle):
     scope = "login"
-    rate = "10/min"
-
-    def get_cache_key(self, request, view):
-        return self.cache_format % {
-            "scope": self.scope,
-            "ident": self.get_ident(request),
-        }
