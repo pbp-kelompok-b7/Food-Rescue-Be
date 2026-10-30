@@ -8,12 +8,7 @@ from common.serializers import DecimalStringField, RFC3339DateTimeField, StringF
 from common.serializers import StrictSerializer
 from .models import ResourceListing, ListingStatus
 from shared.enums import ResourceType, Suitability, Mode, Unit
-
-
-CATEGORIES = {
-    ResourceType.PACKAGED_FOOD_SURPLUS: ('prepared_meal', 'bakery', 'snack'),
-    ResourceType.COMPOSTABLE_FOOD_WASTE: ('coffee_grounds', 'fruit_vegetable_scraps', 'eggshells'),
-}
+from shared.reference_data import CATEGORIES
 
 
 class ListingLocationSerializer(StrictSerializer):

@@ -68,7 +68,7 @@ class SharedMigrationPreservationTests(TransactionTestCase):
         from requests_app.models import ResourceRequest
         from shared.models import AuditEvent
         old_target = [("shared", "0001_initial")]
-        new_target = [("shared", "0002_shared_throttle_buckets")]
+        new_target = [("shared", "0003_merge_location_and_throttle")]
         self.addCleanup(lambda: MigrationExecutor(connection).migrate(new_target))
         MigrationExecutor(connection).migrate(old_target)
         user = get_user_model().objects.create_user(email="migration@example.test", display_name="Owner")
@@ -86,3 +86,27 @@ class SharedMigrationPreservationTests(TransactionTestCase):
         with connection.cursor() as cursor:
             cursor.execute("SELECT COUNT(*) FROM shared_throttlebucket")
             self.assertEqual(cursor.fetchone()[0], 0)
+
+    def test_merge_preserves_existing_location_cache_and_provider_gate(self):
+        from datetime import timedelta
+        from django.db import connection
+        from django.db.migrations.executor import MigrationExecutor
+        from shared.models import LocationProviderState, LocationSearchCache, ThrottleBucket
+
+        target = [("shared", "0003_merge_location_and_throttle")]
+        self.addCleanup(lambda: MigrationExecutor(connection).migrate(target))
+        MigrationExecutor(connection).migrate([
+            ("shared", "0002_locationproviderstate_locationsearchcache"),
+        ])
+        expires_at = timezone.now() + timedelta(days=1)
+        gate_at = timezone.now() + timedelta(seconds=1)
+        LocationSearchCache.objects.create(key='a' * 64, results=[{'label': 'Depok'}], expires_at=expires_at)
+        LocationProviderState.objects.create(key='b' * 64, next_request_at=gate_at)
+        before_cache = list(LocationSearchCache.objects.values())
+        before_gate = list(LocationProviderState.objects.values())
+
+        MigrationExecutor(connection).migrate(target)
+
+        self.assertEqual(list(LocationSearchCache.objects.values()), before_cache)
+        self.assertEqual(list(LocationProviderState.objects.values()), before_gate)
+        self.assertEqual(ThrottleBucket.objects.count(), 0)

@@ -200,13 +200,14 @@ class SharedIntegrationTests(TestCase):
         self.assertNotIn(self.owner.whatsapp_number, str(event.summary))
 
     def test_rate_limits_are_scoped_and_return_retry_after(self):
+        from unittest.mock import patch
         from django.test import override_settings
         from common.authentication import SharedRateThrottle
         from shared.models import ThrottleBucket
         rates = {key: "2/min" for key in SharedRateThrottle.default_rates}
-        with override_settings(CONTRACT_THROTTLE_RATES=rates):
+        with override_settings(CONTRACT_THROTTLE_RATES=rates), patch("shared.views.search_locations", return_value=[]):
             for _ in range(2):
-                self.assertEqual(self.client.get("/api/v1/locations/search/?q=Depok").status_code, 501)
+                self.assertEqual(self.client.get("/api/v1/locations/search/?q=Depok").status_code, 200)
             response = self.client.get("/api/v1/locations/search/?q=Depok")
             self.assertEqual(response.status_code, 429)
             self.assertEqual(response.data["errors"][0]["code"], "throttled")
@@ -215,7 +216,7 @@ class SharedIntegrationTests(TestCase):
             response = self.client.post(f"/api/v1/listings/{self.source.pk}/claims/", {"quantity": "2"}, format="json")
             self.assertEqual(response.status_code, 429)
             self.client.force_authenticate(self.outsider)
-            self.assertEqual(self.client.get("/api/v1/locations/search/?q=Depok").status_code, 501)
+            self.assertEqual(self.client.get("/api/v1/locations/search/?q=Depok").status_code, 200)
             self.client.force_authenticate(self.admin)
             for _ in range(2):
                 response = self.client.patch("/api/v1/admin/reservations/999999/", {"reason": "Review"}, format="json")
@@ -264,11 +265,11 @@ class SharedIntegrationTests(TestCase):
         import time
         from unittest.mock import patch
         from django.test import override_settings
-        with override_settings(CONTRACT_THROTTLE_RATES={"location": "1/min"}):
-            self.assertEqual(self.client.get("/api/v1/locations/search/?q=Depok").status_code, 501)
+        with override_settings(CONTRACT_THROTTLE_RATES={"location": "1/min"}), patch("shared.views.search_locations", return_value=[]):
+            self.assertEqual(self.client.get("/api/v1/locations/search/?q=Depok").status_code, 200)
             self.assertEqual(self.client.get("/api/v1/locations/search/?q=Depok").status_code, 429)
             with patch("common.authentication.SharedRateThrottle.timer", return_value=time.time()+61):
-                self.assertEqual(self.client.get("/api/v1/locations/search/?q=Depok").status_code, 501)
+                self.assertEqual(self.client.get("/api/v1/locations/search/?q=Depok").status_code, 200)
 
 
 from django.test import TransactionTestCase
