@@ -4,8 +4,8 @@ from django.views.decorators.cache import never_cache
 from common.responses import success
 from common.serializers import StrictSerializer
 from .reference_data import reference_payload
-from .serializers import LocationSearchQuerySerializer
-from .services import search_locations
+from .serializers import LocationSearchQuerySerializer, LocationSuggestionQuerySerializer
+from .services import search_locations, supports_location_suggestions, LocationUnavailable
 
 
 @api_view(['GET'])
@@ -59,4 +59,18 @@ def reference_data(request):
 def locations_search(request):
     query = LocationSearchQuerySerializer(data=request.query_params)
     query.is_valid(raise_exception=True)
+    return success({"results": search_locations(**query.validated_data)})
+
+
+@never_cache
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def locations_suggestions(request):
+    from django.conf import settings
+    query = LocationSuggestionQuerySerializer(data=request.query_params)
+    query.is_valid(raise_exception=True)
+    # Public Nominatim forbids autocomplete. Never send typing-triggered traffic
+    # there if an operator switches the manual-search provider back to it.
+    if not supports_location_suggestions(settings.LOCATION_SEARCH_URL):
+        raise LocationUnavailable('Saran lokasi tidak tersedia pada penyedia ini. Gunakan pencarian manual.')
     return success({"results": search_locations(**query.validated_data)})

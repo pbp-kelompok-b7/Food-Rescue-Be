@@ -24,3 +24,7 @@ class LocationSearchQuerySerializer(StrictSerializer):
 
     def validate_area(self, value):
         return " ".join(value.split())
+
+
+class LocationSuggestionQuerySerializer(LocationSearchQuerySerializer):
+    q = serializers.CharField(min_length=2, max_length=200)

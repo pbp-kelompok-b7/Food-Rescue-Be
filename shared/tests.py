@@ -322,6 +322,12 @@ class LocationConcurrencyTests(TransactionTestCase):
 
 
 class PhotonSearchTests(SimpleTestCase):
+    def test_city_result_uses_its_own_name_instead_of_parent_province(self):
+        from shared.services import _normalize_results
+        payload = {"type": "FeatureCollection", "features": [{"geometry": {"type": "Point", "coordinates": [106.8, -6.4]},
+            "properties": {"type": "city", "name": "Depok", "state": "West Java", "country": "Indonesia"}}]}
+        self.assertEqual(_normalize_results(payload, 5)[0]["area"], "Depok")
+
     def test_partial_search_normalizes_geojson_and_sends_photon_parameters(self):
         from shared.services import _fetch_locations
         payload = {"type": "FeatureCollection", "features": [{"type": "Feature",
@@ -341,3 +347,29 @@ class PhotonSearchTests(SimpleTestCase):
         for geometry in ({"type": "Point", "coordinates": [106]}, {"type": "Polygon", "coordinates": []}):
             with self.assertRaises(LocationProviderError):
                 _normalize_results({"type": "FeatureCollection", "features": [{"geometry": geometry, "properties": {"name": "Test"}}]}, 5)
+
+
+@override_settings(CONTRACT_THROTTLE_RATES={}, LOCATION_SEARCH_URL="https://photon.komoot.io/api/")
+class LocationSuggestionTests(SimpleTestCase):
+    def test_accepts_two_characters_and_preserves_provider_locations(self):
+        result = {"label": "Depok, West Java, Indonesia", "area": "Depok", "latitude": -6.4,
+                  "longitude": 106.8, "attribution": ATTRIBUTION}
+        with patch("shared.views.search_locations", return_value=[result]) as lookup:
+            response = APIClient().get("/api/v1/locations/suggestions/?q=de")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["data"]["results"], [result])
+        lookup.assert_called_once_with(q="de", limit=5)
+        self.assertIn("no-store", response["Cache-Control"])
+
+    def test_short_repeated_or_unknown_parameters_do_not_reach_provider(self):
+        with patch("shared.views.search_locations") as lookup:
+            for query in ("q=d", "q=", "q=de&q=dep", "q=de&limit=0", "q=de&extra=yes"):
+                self.assertEqual(APIClient().get("/api/v1/locations/suggestions/?" + query).status_code, 400)
+            lookup.assert_not_called()
+
+    @override_settings(LOCATION_SEARCH_URL="https://nominatim.openstreetmap.org/search")
+    def test_never_uses_public_nominatim_for_autocomplete(self):
+        with patch("shared.views.search_locations") as lookup:
+            response = APIClient().get("/api/v1/locations/suggestions/?q=de")
+        self.assertEqual(response.status_code, 503)
+        lookup.assert_not_called()

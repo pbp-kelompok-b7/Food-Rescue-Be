@@ -18,8 +18,8 @@ limit outside 1–10 (default 5).
 
 The default provider is Photon (`https://photon.komoot.io/api/`), which supports
 partial place names and typo-tolerant searches. Its GeoJSON is normalized to the
-same response shape. Searches remain explicitly submitted; no background or
-per-keystroke requests are made. Results are restricted to a regional bounding
+same response shape. Manual location-form searches remain explicitly submitted. Area autocomplete
+uses the separate suggestions endpoint documented below. Results are restricted to a regional bounding
 box (94,-12,142,7), which also intersects nearby countries.
 
 Photon demo terms: https://github.com/komoot/photon#demo-server . Reasonable
@@ -90,3 +90,18 @@ Supply, Request and Offer forms show a visible search button, address results,
 and a map pin after selection. Supply and Request detail pages also show the
 full label and map. Map tiles use an OpenStreetMap embed; loading the map does
 not issue another geocoding request. External provider outages remain possible.
+
+## Area autocomplete
+
+`GET /api/v1/locations/suggestions/?q=de&limit=5` accepts 2–200 characters
+and returns the same normalized location shape. It shares the cache, global
+provider gate and per-client location throttle with manual search. It is enabled
+only for Photon endpoints; public Nominatim is explicitly rejected, including
+when a deployment switches its manual provider back to Nominatim.
+
+The Area fields on Supply and Request browsing show suggestions after a
+1.2-second typing pause. Editing aborts/ignores stale responses, and there are no
+automatic retries. Arrow keys and Enter select; Escape dismisses. A selection
+fills the canonical area, then the existing search button applies resource
+filters. A city feature uses its own name (Depok), not its parent state (West
+Java). The resource area's exact matching contract remains unchanged.
