@@ -227,4 +227,40 @@ Provider/receiver adalah behavioral role, bukan account role terpisah.
 - automatic safety verification
 
 ## AI Disclosure
-Dalam proses pengerjaan proyek ini, tim menggunakan bantuan AI sebagai alat pendukung untuk _brainstorming_ ide, penyusunan awal Product Requirements Document (PRD), perumusan _user flow_, serta penyusunan struktur modul aplikasi. AI juga digunakan untuk membantu mengevaluasi _scope_ fitur agar tetap sesuai dengan tema Sustainable Living dan kebutuhan tugas. 
+
+### Overview
+
+Aku menggunakan AI (Codex) untuk membantu proses perancangan, implementasi, review, dan debugging backend Food Rescue. Bantuan AI yang digunakan meliputi:
+
+1. Brainstorming ide, penyusunan awal Product Requirements Document (PRD), user flow, dan pembagian modul sesuai requirement tugas.
+2. Penyusunan struktur Django REST Framework, model, API contract, serta penjelasan alur kode seperti serializer, queryset, dan service.
+3. Penulisan dan perbaikan kode pada bagian yang aku kerjakan, termasuk Supply Listing, shared foundation, dan autentikasi.
+4. Penulisan dan pelaksanaan tes, review pull request, serta pemeriksaan kesesuaian respons API dengan kontrak.
+5. Konfigurasi deployment dan debugging integrasi backend PWS dengan frontend Vercel, termasuk CSRF, session cookie, dan Google Sign-In.
+
+### Strategi Prompting
+
+Aku membagi permintaan berdasarkan fitur atau masalah yang sedang dikerjakan. Untuk implementasi, aku memberikan requirement, API contract, atau referensi desain sebagai acuan. Untuk review, aku meminta AI memeriksa perubahan pada branch atau pull request tertentu. Ketika menemukan error, aku memberikan pesan error, screenshot, atau hasil pengujian, lalu meminta AI menelusuri penyebabnya dari kode dan perilaku aplikasi.
+
+### Keterbatasan AI
+
+Hasil AI belum tentu sesuai dengan kondisi aplikasi yang sedang berjalan. Tes yang menggunakan mock dapat membantu memeriksa logika kode, tetapi belum membuktikan integrasi dengan layanan Google atau deployment berhasil. Implementasi juga tetap perlu dibandingkan dengan requirement dan API contract agar tidak hanya mengikuti asumsi AI.
+
+Contohnya, saat debugging Google Sign-In, pesan `invalid_credentials` sempat dikaitkan dengan Client ID dan spasi pada konfigurasi. Setelah konfigurasi diperiksa dan login masih gagal, pemeriksaan dilanjutkan ke runtime PWS. Dari pemeriksaan tersebut ditemukan selisih waktu sekitar dua detik antara PWS dan Google, sementara verifikasi token belum memberikan toleransi waktu. Proses ini menunjukkan bahwa dugaan AI perlu diuji dengan bukti runtime sebelum dianggap sebagai penyebab pasti.
+
+### Perbaikan Manual
+
+Aku mencoba ulang alur aplikasi melalui browser, memeriksa request dan respons melalui DevTools, serta membandingkan konfigurasi Client ID pada layanan terkait. Ketika saran awal belum menyelesaikan error, aku menyampaikan hasil percobaan tersebut agar pemeriksaan dilanjutkan. Perubahan kode untuk debugging ini ditulis dengan bantuan AI; pengecekan melalui browser dan keputusan untuk menerapkan perubahan tetap melibatkan pemeriksaanku.
+
+Referensi log chat:
+
+```text
+Perancangan requirement, design figma, user flow, dan API contract:
+https://chatgpt.com/s/cx_6ae4cc18edb08191bd1f42c682d4716e
+
+Implementasi backend dan penjelasan kode:
+https://chatgpt.com/s/cx_6ae4cc23a61081919f16db482e3a5b76
+
+Deployment dan debugging autentikasi:
+https://chatgpt.com/s/cx_6ae4cc36e0f48191b2f6a3111eb44966
+```
