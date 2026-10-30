@@ -228,7 +228,11 @@ Provider/receiver adalah behavioral role, bukan account role terpisah.
 
 ## AI Disclosure
 
-### Overview
+Penggunaan AI dalam proyek ini dijelaskan per anggota, sesuai bantuan yang digunakan dan hasil yang diperiksa oleh masing-masing individu.
+
+### Fiqhi Deski Ismail — 2506534245
+
+#### Overview
 
 Aku menggunakan AI (Codex) untuk membantu proses perancangan, implementasi, review, dan debugging backend Food Rescue. Bantuan AI yang digunakan meliputi:
 
@@ -238,17 +242,17 @@ Aku menggunakan AI (Codex) untuk membantu proses perancangan, implementasi, revi
 4. Penulisan dan pelaksanaan tes, review pull request, serta pemeriksaan kesesuaian respons API dengan kontrak.
 5. Konfigurasi deployment dan debugging integrasi backend PWS dengan frontend Vercel, termasuk CSRF, session cookie, dan Google Sign-In.
 
-### Strategi Prompting
+#### Strategi Prompting
 
 Aku membagi permintaan berdasarkan fitur atau masalah yang sedang dikerjakan. Untuk implementasi, aku memberikan requirement, API contract, atau referensi desain sebagai acuan. Untuk review, aku meminta AI memeriksa perubahan pada branch atau pull request tertentu. Ketika menemukan error, aku memberikan pesan error, screenshot, atau hasil pengujian, lalu meminta AI menelusuri penyebabnya dari kode dan perilaku aplikasi.
 
-### Keterbatasan AI
+#### Keterbatasan AI
 
 Hasil AI belum tentu sesuai dengan kondisi aplikasi yang sedang berjalan. Tes yang menggunakan mock dapat membantu memeriksa logika kode, tetapi belum membuktikan integrasi dengan layanan Google atau deployment berhasil. Implementasi juga tetap perlu dibandingkan dengan requirement dan API contract agar tidak hanya mengikuti asumsi AI.
 
 Contohnya, saat debugging Google Sign-In, pesan `invalid_credentials` sempat dikaitkan dengan Client ID dan spasi pada konfigurasi. Setelah konfigurasi diperiksa dan login masih gagal, pemeriksaan dilanjutkan ke runtime PWS. Dari pemeriksaan tersebut ditemukan selisih waktu sekitar dua detik antara PWS dan Google, sementara verifikasi token belum memberikan toleransi waktu. Proses ini menunjukkan bahwa dugaan AI perlu diuji dengan bukti runtime sebelum dianggap sebagai penyebab pasti.
 
-### Perbaikan Manual
+#### Perbaikan Manual
 
 Aku mencoba ulang alur aplikasi melalui browser, memeriksa request dan respons melalui DevTools, serta membandingkan konfigurasi Client ID pada layanan terkait. Ketika saran awal belum menyelesaikan error, aku menyampaikan hasil percobaan tersebut agar pemeriksaan dilanjutkan. Perubahan kode untuk debugging ini ditulis dengan bantuan AI; pengecekan melalui browser dan keputusan untuk menerapkan perubahan tetap melibatkan pemeriksaanku.
 
@@ -261,6 +265,81 @@ https://chatgpt.com/s/cx_6ae4cc18edb08191bd1f42c682d4716e
 Implementasi backend dan penjelasan kode:
 https://chatgpt.com/s/cx_6ae4cc23a61081919f16db482e3a5b76
 
-Deployment dan debugging autentikasi:
+Review PR dan diagnosis error API:
 https://chatgpt.com/s/cx_6ae4cc36e0f48191b2f6a3111eb44966
+```
+
+### Nabila Oktavia Ramadhani — 2506593613
+
+#### Overview
+
+[Isi alat/model AI yang digunakan dan bantuan yang diterima dalam pengerjaan Pickup & Fulfillment. Jika tidak menggunakan AI, nyatakan di sini.]
+
+#### Strategi Prompting
+
+[Isi cara menyusun prompt dan konteks yang diberikan kepada AI.]
+
+#### Keterbatasan AI
+
+[Isi keterbatasan atau kesalahan hasil AI yang ditemukan selama pengerjaan.]
+
+#### Perbaikan Manual
+
+[Isi pemeriksaan dan perbaikan yang dilakukan sendiri terhadap hasil AI.]
+
+Referensi log chat:
+
+```text
+[LINK_CHAT_NABILA_1]
+[LINK_CHAT_NABILA_2]
+```
+
+### Evan Andrian — 2506539082
+
+#### Overview
+
+[Isi alat/model AI yang digunakan dan bantuan yang diterima dalam pengerjaan Match/Reservation. Jika tidak menggunakan AI, nyatakan di sini.]
+
+#### Strategi Prompting
+
+[Isi cara menyusun prompt dan konteks yang diberikan kepada AI.]
+
+#### Keterbatasan AI
+
+[Isi keterbatasan atau kesalahan hasil AI yang ditemukan selama pengerjaan.]
+
+#### Perbaikan Manual
+
+[Isi pemeriksaan dan perbaikan yang dilakukan sendiri terhadap hasil AI.]
+
+Referensi log chat:
+
+```text
+[LINK_CHAT_EVAN_1]
+[LINK_CHAT_EVAN_2]
+```
+
+### Kaysan Navid Musyaffa — 2506625470
+
+#### Overview
+
+[Isi alat/model AI yang digunakan dan bantuan yang diterima dalam pengerjaan Request Board. Jika tidak menggunakan AI, nyatakan di sini.]
+
+#### Strategi Prompting
+
+[Isi cara menyusun prompt dan konteks yang diberikan kepada AI.]
+
+#### Keterbatasan AI
+
+[Isi keterbatasan atau kesalahan hasil AI yang ditemukan selama pengerjaan.]
+
+#### Perbaikan Manual
+
+[Isi pemeriksaan dan perbaikan yang dilakukan sendiri terhadap hasil AI.]
+
+Referensi log chat:
+
+```text
+[LINK_CHAT_KAYSAN_1]
+[LINK_CHAT_KAYSAN_2]
 ```
