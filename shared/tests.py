@@ -70,6 +70,7 @@ class ReferenceDataTests(SimpleTestCase):
             self.assertNotIn(field, response.content.decode())
 
 
+@override_settings(CONTRACT_THROTTLE_RATES={})
 class LocationQueryTests(SimpleTestCase):
     def test_invalid_queries_do_not_reach_provider(self):
         cases = (
@@ -105,6 +106,15 @@ class LocationQueryTests(SimpleTestCase):
 
 @override_settings(**PROVIDER_SETTINGS)
 class LocationSearchTests(TestCase):
+    @override_settings(CONTRACT_THROTTLE_RATES={"location": "2/min"})
+    def test_shared_throttle_also_limits_cached_searches_without_extra_provider_calls(self):
+        self.assertEqual(self.search().status_code, 200)
+        self.assertEqual(self.search().status_code, 200)
+        response = self.search()
+        self.assert_error(response, 429, "throttled")
+        self.assertGreater(int(response["Retry-After"]), 0)
+        self.assertEqual(self.http.call_count, 1)
+
     def setUp(self):
         self.client = APIClient()
         clock = patch("shared.services.timezone.now", return_value=NOW)

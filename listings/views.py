@@ -1,3 +1,5 @@
+from django.db import transaction
+from shared.models import record_audit, audit_state
 from django.db.models import Q
 from django.utils import timezone
 from django.shortcuts import get_object_or_404
@@ -31,7 +33,7 @@ def _listing_id(value):
 def listings(request):
     if request.method == "GET":
         # Treat an explicitly empty parameter as input, rather than an omitted HTML field.
-        serializer = ListingQuerySerializer(data=request.query_params.dict())
+        serializer = ListingQuerySerializer(data=request.query_params)
         serializer.is_valid(raise_exception=True)
 
         filters = serializer.validated_data
@@ -82,7 +84,10 @@ def listings(request):
     if request.method == "POST":
         serializer = ListingSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        listing = serializer.save(owner=request.user, created_by=request.user)
+        with transaction.atomic():
+            listing = serializer.save(owner=request.user, created_by=request.user)
+            record_audit(actor=request.user, entity_type="ResourceListing", entity_id=listing.pk,
+                         action="create", summary={"before": None, "after": audit_state(listing)})
 
         listing = listings_with_state(timezone.now()).get(pk=listing.pk)
 
@@ -98,7 +103,7 @@ def listings(request):
 @permission_classes([IsAuthenticatedOrReadOnly])
 def listings_detail(request, pk):
     pk = _listing_id(pk)
-    StrictSerializer(data=request.query_params.dict()).is_valid(raise_exception=True)
+    StrictSerializer(data=request.query_params).is_valid(raise_exception=True)
     if request.method == "GET":
         now = timezone.now()
         listing = get_object_or_404(listings_with_state(now), pk=pk)
@@ -140,7 +145,7 @@ def listings_detail(request, pk):
 @permission_classes([IsAuthenticated])
 def listings_detail_close(request, pk):
     pk = _listing_id(pk)
-    StrictSerializer(data=request.query_params.dict()).is_valid(raise_exception=True)
+    StrictSerializer(data=request.query_params).is_valid(raise_exception=True)
     listing = services.close_listing(pk, request.user, request.data)
     return success(ListingSerializer(listing).data, 'Listing berhasil ditutup')
 

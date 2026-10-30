@@ -1,7 +1,7 @@
 from decimal import Decimal
 
 from django.db import transaction
-from django.db.models import DecimalField, Exists, F, OuterRef, Q, Subquery, Sum, Value
+from django.db.models import Case, CharField, When, DecimalField, Exists, F, OuterRef, Q, Subquery, Sum, Value
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 from django.views.decorators.cache import never_cache
@@ -15,7 +15,8 @@ from common.pagination import ContractPagination
 from common.responses import failure, success
 from pickups.models import PickupStatus
 from reservations.models import Reservation, ReservationStatus
-from shared.models import AuditEvent
+from shared.models import AuditEvent, record_audit, audit_state
+from shared.services import allocated_filter, completed_filter, utc_now
 from .models import ResourceRequest, RequestStatus
 from .serializers import (
     RequestCloseSerializer, RequestDeleteSerializer, RequestQuerySerializer,
@@ -33,7 +34,8 @@ class RequestPagination(ContractPagination):
             raise NotFound("Page does not exist.", code="page_not_found") from exc
 
 
-def requests_with_quantities():
+def requests_with_quantities(now=None):
+    now = utc_now(now)
     quantity_field = DecimalField(max_digits=15, decimal_places=3)
     accepted = Reservation.objects.filter(
         request_id=OuterRef("pk"), status=ReservationStatus.ACCEPTED,
@@ -45,15 +47,21 @@ def requests_with_quantities():
                         Value(Decimal("0.000")), output_field=quantity_field)
 
     return ResourceRequest.objects.select_related("owner").annotate(
-        quantity_allocated=total(accepted.exclude(pickup__status__in=(
-            PickupStatus.COMPLETED, PickupStatus.CANCELLED, PickupStatus.NO_SHOW,
-        ))),
-        quantity_fulfilled=total(accepted.filter(pickup__status=PickupStatus.COMPLETED)),
-    ).annotate(quantity_remaining=F("quantity_needed") - F("quantity_allocated") - F("quantity_fulfilled"))
+        quantity_allocated=total(accepted.filter(allocated_filter(now))),
+        quantity_fulfilled=total(accepted.filter(completed_filter())),
+    ).annotate(quantity_remaining=F("quantity_needed") - F("quantity_allocated") - F("quantity_fulfilled")).annotate(
+        effective_status=Case(
+            When(status__in=(RequestStatus.CLOSED, RequestStatus.EXPIRED, RequestStatus.FULFILLED), then=F("status")),
+            When(quantity_fulfilled__gte=F("quantity_needed"), then=Value(RequestStatus.FULFILLED)),
+            When(valid_until__lte=now, then=Value(RequestStatus.EXPIRED)),
+            When(quantity_remaining__lte=0, then=Value(RequestStatus.ALLOCATED)),
+            default=Value(RequestStatus.OPEN), output_field=CharField(),
+        ),
+    )
 
 
 def public_requests(queryset):
-    return queryset.filter(status=RequestStatus.OPEN, valid_until__gt=timezone.now(),
+    return queryset.filter(effective_status=RequestStatus.OPEN, valid_until__gt=timezone.now(),
                            quantity_remaining__gt=0, archived_at__isnull=True)
 
 
@@ -73,7 +81,7 @@ def browse_requests(request):
 
     for field in ("resource_type", "category", "intended_use", "status"):
         if field in filters:
-            queryset = queryset.filter(**{field: filters[field]})
+            queryset = queryset.filter(**{("effective_status" if field == "status" else field): filters[field]})
     if "donate_only" in filters:
         queryset = queryset.filter(donate_only=filters["donate_only"] == "true")
     if "area" in filters:
@@ -124,6 +132,8 @@ def create_request(request):
     serializer.is_valid(raise_exception=True)
     with transaction.atomic():
         instance = ResourceRequest.objects.create(owner=user, created_by=user, **serializer.validated_data)
+        record_audit(actor=user, entity_type="ResourceRequest", entity_id=instance.pk,
+                     action="create", summary={"before": None, "after": audit_state(instance)})
         instance = requests_with_quantities().get(pk=instance.pk)
     return success(ResourceRequestSerializer(instance).data, message="Request created.", status=201)
 
@@ -148,6 +158,7 @@ def update_request(request, pk):
         serializer = RequestWriteSerializer(instance=instance, data=request.data, partial=True,
                                              context={"has_reservations": instance.reservations.exists()})
         serializer.is_valid(raise_exception=True)
+        before = audit_state(instance)
         changes = serializer.validated_data
         quantities = requests_with_quantities().get(pk=pk)
         needed = changes.get("quantity_needed", instance.quantity_needed)
@@ -169,12 +180,15 @@ def update_request(request, pk):
                 instance.status = RequestStatus.OPEN
         instance.version += 1
         instance.save(update_fields=[*changes, "status", "version", "updated_at"])
+        record_audit(actor=user, entity_type="ResourceRequest", entity_id=instance.pk,
+                     action="update", summary={"before": before, "after": audit_state(instance),
+                                               "changed_fields": sorted(changes)})
         instance = requests_with_quantities().get(pk=pk)
     return success(ResourceRequestSerializer(instance).data, message="Request updated.")
 
 
 # Lifecycle operations lock the source before reservations in primary-key order.
-# Keep the audit writer aligned with SF-BE-05 when its shared helper is available.
+# Audit writes use the shared SF-BE-05 helper in the same transaction.
 def _locked_request(user, pk):
     pk = str(pk)
     if not pk.isascii() or not pk.isdecimal() or len(pk) > 19 or not 0 < int(pk) <= 9223372036854775807:
@@ -197,7 +211,7 @@ def _state(source):
 
 
 def _audit(user, entity_type, entity_id, action, reason, before, after):
-    AuditEvent.objects.create(actor=user, entity_type=entity_type, entity_id=str(entity_id),
+    record_audit(actor=user, entity_type=entity_type, entity_id=str(entity_id),
                               action=action, summary={"reason": reason, "before": before, "after": after})
 
 

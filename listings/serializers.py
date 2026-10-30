@@ -4,6 +4,7 @@ from decimal import Decimal
 
 from django.utils import timezone
 from rest_framework import serializers
+from common.serializers import DecimalStringField, RFC3339DateTimeField, StringField
 from common.serializers import StrictSerializer
 from .models import ResourceListing, ListingStatus
 from shared.enums import ResourceType, Suitability, Mode, Unit
@@ -32,13 +33,6 @@ class ListingLocationSerializer(StrictSerializer):
         return attrs
 
 
-class DecimalStringField(serializers.DecimalField):
-    def to_internal_value(self, data):
-        if not isinstance(data, str):
-            self.fail('invalid')
-        return super().to_internal_value(data)
-
-
 class ListingOwnerSerializer(serializers.Serializer):
     id = serializers.IntegerField(read_only=True)
     display_name = serializers.CharField(read_only=True)
@@ -64,6 +58,7 @@ class ListingSerializer(StrictSerializer, serializers.ModelSerializer):
         child=serializers.ChoiceField(choices=Suitability.choices), min_length=1,
     )
     location = ListingLocationSerializer()
+    available_until = RFC3339DateTimeField()
     storage_notes = serializers.CharField(max_length=2000, required=False, allow_null=True, allow_blank=True, default=None)
     allergen_notes = serializers.CharField(max_length=2000, required=False, allow_null=True, allow_blank=True, default=None)
 
@@ -140,7 +135,7 @@ class ListingSerializer(StrictSerializer, serializers.ModelSerializer):
 
 
 class ListingCloseSerializer(StrictSerializer):
-    reason = serializers.CharField(min_length=1, max_length=1000)
+    reason = StringField(min_length=1, max_length=1000)
 
 
 class ListingQuerySerializer(StrictSerializer):

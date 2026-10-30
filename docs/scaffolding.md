@@ -11,7 +11,11 @@ Scaffold mengikuti Technical Design Revisi 2. Ada 62 operasi HTTP di `/api/v1/`,
 
 Tidak ada generator class/route, manifest runtime, service factory backend, atau file selector/permission kosong. Business logic bisa ditulis langsung di app masing-masing. Pisahkan ke service hanya ketika kompleksitas transaksi memang membutuhkannya.
 
-## Status implementasi
+## Pembaruan SF-BE-05
+
+Dokumen ini mencatat kondisi scaffold awal, bukan status akhir seluruh modul. Validator bersama, audit atomik, cache policy privat dan throttle lintas worker kini tersedia di berkas `common`/`shared` yang sudah ada; detail konfigurasi dan migrasi ada di [README](../README.md). Implementasi lifecycle yang sudah tersedia diuji bersama helper tersebut. Endpoint placeholder tetap tidak dianggap selesai; tidak ada expiry command yang ditambahkan oleh SF-BE-05.
+
+## Status implementasi awal
 
 Endpoint masih mengembalikan 501. Akses menggunakan permission DRF standar; login/register dilindungi CSRF. Serializer, filter, per-object authorization, operasi quantity/state, audit writes, Nominatim, dan expiry belum diimplementasikan. Tidak ada expiry command atau rate limit custom yang berpura-pura siap.
 

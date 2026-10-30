@@ -1,6 +1,7 @@
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.exceptions import NotFound, ValidationError
 from .responses import success
+from .serializers import validate_query_params
 
 
 class ContractPagination(PageNumberPagination):
@@ -9,6 +10,7 @@ class ContractPagination(PageNumberPagination):
     max_page_size = 100
 
     def get_page_size(self, request):
+        validate_query_params(request.query_params, set(request.query_params))
         raw = request.query_params.get("page_size")
         if raw is None:
             return self.page_size
