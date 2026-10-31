@@ -273,25 +273,47 @@ https://chatgpt.com/s/cx_6ae4cc36e0f48191b2f6a3111eb44966
 
 #### Overview
 
-[Isi alat/model AI yang digunakan dan bantuan yang diterima dalam pengerjaan Pickup & Fulfillment. Jika tidak menggunakan AI, nyatakan di sini.]
+Untuk bagian backend, saya menggunakan bantuan Claude, sedangkan untuk bagian frontend kebanyakan dibantu dengan penggunaan Codex. Penggunaan AI meliputi:
+
+Backend:
+1. Pemahaman cara implementasi API sesuai contract.
+2. Membantu pembuatan dan penyesuaian unit test.
+3. Melakukan review terhadap implementasi kode dan cakupannya untuk memastikan kesesuaian dengan acceptance criteria setiap issue.
+
+Frontend:
+1. Mengganti placeholder dengan implementasi antarmuka yang sesuai design figma.
+2. Membantu pembuatan dan penyesuaian unit test.
+3. Membuat data fixture untuk mendukung pengujian alur modul secara lokal (localhost).
+3. Melakukan review terhadap implementasi kode dan cakupannya untuk memastikan kesesuaian dengan acceptance criteria setiap issue.
 
 #### Strategi Prompting
 
-[Isi cara menyusun prompt dan konteks yang diberikan kepada AI.]
+Dalam melakukan prompting saya memberikan referensi API contract, issue yang ingin dikerjakan, referensi kode per file yang ingin dilanjutkan/direview implementasinya, dan design figma. Setelah kode digenerate, saya melakukan review terhadap kode tersebut, melakukan tes untuk kesesuaian body request dan respone pada DevTools secara manual, dan meminta AI untuk melakukan penyesuaian ulang.
 
 #### Keterbatasan AI
 
-[Isi keterbatasan atau kesalahan hasil AI yang ditemukan selama pengerjaan.]
+Beberapa kesalahan yang ditemukan pada hasil AI selama pengerjaan:
+
+1. AI menghasilkan beberapa unit test yang tidak sepenuhnya sesuai dengan cakupan API contract 7.5.2–7.5.4 serta menguji kasus yang redundan.
+2. AI sempat memberikan rekomendasi yang tidak konsisten terkait HTTP status code untuk receiver yang mencoba melakukan PATCH pickup. AI awalnya menyarankan penggunaan 404 yang seharusnya 403, sesuai dengan API contract.
 
 #### Perbaikan Manual
 
-[Isi pemeriksaan dan perbaikan yang dilakukan sendiri terhadap hasil AI.]
+- Meninjau kembali API contract dan acceptance criteria pada setiap issue sebagai acuan untuk memvalidasi hasil implementasi AI.
+- Memeriksa cakupan unit test, mengidentifikasi pengujian yang tidak sesuai atau redundan, serta menyesuaikannya dengan kebutuhan pengujian pada API contract.
+- Memverifikasi HTTP status code, request body, dan response API berdasarkan API contract melalui pengujian manual menggunakan DevTools.
+- Meninjau kembali implementasi frontend dengan membandingkan hasil antarmuka terhadap desain Figma dan memastikan alur interaksi sesuai dengan kebutuhan modul.
+- Memeriksa kembali hasil perubahan kode dan meminta AI melakukan revisi apabila ditemukan ketidaksesuaian.
 
 Referensi log chat:
 
 ```text
-[LINK_CHAT_NABILA_1]
-[LINK_CHAT_NABILA_2]
+https://claude.ai/share/1caafc92-f403-4caf-bb1e-af1dbe1b1a68
+https://claude.ai/share/ae9c7e8e-9eb5-4618-995c-9281c452a3e7
+https://claude.ai/share/360a034b-55a0-45a0-b648-8be1e31bf322
+
+https://chatgpt.com/s/cx_6ae5d8086fc08191b08c4274df0dd011
+https://chatgpt.com/s/cx_6ae5d858b30881918cd8eb1f1e6c813b
 ```
 
 ### Evan Andrian — 2506539082
