@@ -3,7 +3,9 @@ from shared.models import record_audit, audit_state
 from django.db.models import Q
 from django.utils import timezone
 from django.shortcuts import get_object_or_404
-from rest_framework.decorators import api_view, permission_classes
+from rest_framework.decorators import api_view, permission_classes, parser_classes
+from rest_framework.parsers import JSONParser
+from common.photos import ResourceMultipartParser
 from rest_framework.exceptions import NotAuthenticated, NotFound, ValidationError
 from rest_framework.permissions import IsAdminUser, IsAuthenticated, IsAuthenticatedOrReadOnly
 from common.pagination import ContractPagination
@@ -30,6 +32,7 @@ def _listing_id(value):
 # GET, POST /api/v1/listings/
 @api_view(['GET', 'POST'])
 @permission_classes([IsAuthenticatedOrReadOnly])
+@parser_classes([JSONParser, ResourceMultipartParser])
 def listings(request):
     if request.method == "GET":
         # Treat an explicitly empty parameter as input, rather than an omitted HTML field.
@@ -101,6 +104,7 @@ def listings(request):
 # GET, PATCH, DELETE /api/v1/listings/{id}/
 @api_view(['GET', 'PATCH', 'DELETE'])
 @permission_classes([IsAuthenticatedOrReadOnly])
+@parser_classes([JSONParser, ResourceMultipartParser])
 def listings_detail(request, pk):
     pk = _listing_id(pk)
     StrictSerializer(data=request.query_params).is_valid(raise_exception=True)

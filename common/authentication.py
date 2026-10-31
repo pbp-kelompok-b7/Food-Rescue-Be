@@ -79,7 +79,7 @@ class SharedRateThrottle(SimpleRateThrottle):
 class ContractThrottle(SharedRateThrottle):
     def allow_request(self, request, view):
         path = request.path
-        if path == "/api/v1/locations/search/":
+        if path in ("/api/v1/locations/search/", "/api/v1/locations/suggestions/"):
             self.scope = "location"
         elif request.method == "POST" and path.endswith(("/claims/", "/offers/")):
             self.scope = "submission"

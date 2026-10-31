@@ -16,7 +16,18 @@ limit outside 1–10 (default 5).
 
 ## Provider policy and frontend integration
 
-Nominatim's public server policy is mandatory:
+The default provider is Photon (`https://photon.komoot.io/api/`), which supports
+partial place names and typo-tolerant searches. Its GeoJSON is normalized to the
+same response shape. Manual location-form searches remain explicitly submitted. Area autocomplete
+uses the separate suggestions endpoint documented below. Results are restricted to a regional bounding
+box (94,-12,142,7), which also intersects nearby countries.
+
+Photon demo terms: https://github.com/komoot/photon#demo-server . Reasonable
+project usage is permitted, with no availability guarantee; use a hosted/private
+provider for larger traffic. Custom Photon deployments should use an `/api/` URL.
+
+`LOCATION_SEARCH_URL` can still point to Nominatim. For its public server, the
+following policy is mandatory:
 https://operations.osmfoundation.org/policies/nominatim/
 
 - Search only when the user submits a search. No autocomplete, periodic lookup,
@@ -45,9 +56,9 @@ Configuration (also in `.env.example`):
 | Variable | Default |
 | --- | --- |
 | `LOCATION_SEARCH_ENABLED` | `True` (set False to disable outgoing geocoding) |
-| `LOCATION_SEARCH_URL` | `https://nominatim.openstreetmap.org/search` |
+| `LOCATION_SEARCH_URL` | `https://photon.komoot.io/api/` |
 | `LOCATION_SEARCH_USER_AGENT` | FoodRescue project identity with repository URL |
-| `LOCATION_SEARCH_TIMEOUT` | 5 seconds for socket operations |
+| `LOCATION_SEARCH_TIMEOUT` | 10 seconds for socket operations |
 | `LOCATION_SEARCH_CACHE_TTL` | 86400 seconds |
 | `LOCATION_SEARCH_MIN_INTERVAL` | 1 second, never allowed below 1 |
 
@@ -72,3 +83,25 @@ Run `python manage.py test shared` and the full suite on PostgreSQL. Provider
 tests are mocked; `LocationConcurrencyTests` require PostgreSQL and exercise
 separate connections. A live provider check is a separate manual lookup, not
 part of the automated suite.
+
+## Map selection
+
+Supply, Request and Offer forms show a visible search button, address results,
+and a map pin after selection. Supply and Request detail pages also show the
+full label and map. Map tiles use an OpenStreetMap embed; loading the map does
+not issue another geocoding request. External provider outages remain possible.
+
+## Area autocomplete
+
+`GET /api/v1/locations/suggestions/?q=de&limit=5` accepts 2–200 characters
+and returns the same normalized location shape. It shares the cache, global
+provider gate and per-client location throttle with manual search. It is enabled
+only for Photon endpoints; public Nominatim is explicitly rejected, including
+when a deployment switches its manual provider back to Nominatim.
+
+The Area fields on Supply and Request browsing show suggestions after a
+1.2-second typing pause. Editing aborts/ignores stale responses, and there are no
+automatic retries. Arrow keys and Enter select; Escape dismisses. A selection
+fills the canonical area, then the existing search button applies resource
+filters. A city feature uses its own name (Depok), not its parent state (West
+Java). The resource area's exact matching contract remains unchanged.

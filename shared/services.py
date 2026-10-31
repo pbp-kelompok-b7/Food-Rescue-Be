@@ -270,6 +270,27 @@ def _retry_after(raw):
 
 
 def _normalize_results(payload, limit):
+    if isinstance(payload, dict) and payload.get("type") == "FeatureCollection":
+        features = payload.get("features")
+        if not isinstance(features, list):
+            raise LocationProviderError()
+        converted = []
+        for feature in features[:limit]:
+            if not isinstance(feature, dict):
+                raise LocationProviderError()
+            props, geometry = feature.get("properties"), feature.get("geometry")
+            if not isinstance(props, dict) or not isinstance(geometry, dict) or geometry.get("type") != "Point":
+                raise LocationProviderError()
+            coordinates = geometry.get("coordinates")
+            if not isinstance(coordinates, list) or len(coordinates) < 2:
+                raise LocationProviderError()
+            parts = [props.get(key) for key in ("name", "housenumber", "street", "district", "city", "county", "state", "postcode", "country")]
+            label = ", ".join(dict.fromkeys(part.strip() for part in parts if isinstance(part, str) and part.strip()))
+            address = {key: props[key] for key in ("city", "county", "state", "country", "name") if key in props}
+            if props.get("type") in ("city", "town") and isinstance(props.get("name"), str):
+                address["city"] = props["name"]
+            converted.append({"display_name": label[:300], "lat": coordinates[1], "lon": coordinates[0], "address": address})
+        payload = converted
     if not isinstance(payload, list):
         raise LocationProviderError()
     results = []
@@ -290,7 +311,7 @@ def _normalize_results(payload, limit):
         except (KeyError, ValueError, TypeError, OverflowError) as exc:
             raise LocationProviderError() from exc
         area = ""
-        for field in ("city", "town", "village", "municipality", "county", "state"):
+        for field in ("city", "town", "village", "municipality", "county", "state", "country", "name"):
             if isinstance(address.get(field), str) and address[field].strip():
                 area = address[field].strip()
                 break
@@ -299,20 +320,35 @@ def _normalize_results(payload, limit):
     return results
 
 
+def supports_location_suggestions(url):
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return False
+    if parsed.hostname == "nominatim.openstreetmap.org":
+        return False
+    return parsed.hostname == "photon.komoot.io" or parsed.path.rstrip("/").endswith("/api")
+
+
 def _fetch_locations(url, user_agent, query, limit, timeout):
     started = monotonic()
+    photon = supports_location_suggestions(url)
+    params = ({"q": query, "limit": limit, "lang": "en", "bbox": "94,-12,142,7"}
+              if photon else {"q": query, "format": "jsonv2", "addressdetails": 1,
+                              "limit": limit, "accept-language": "id,en"})
     try:
         with requests.get(
-            url, params={"q": query, "format": "jsonv2", "addressdetails": 1,
-                         "limit": limit, "accept-language": "id,en"},
+            url, params=params,
             headers={"User-Agent": user_agent, "Accept": "application/json"},
             timeout=timeout, allow_redirects=False, stream=True,
         ) as response:
             if response.status_code == 429:
                 raise LocationRateLimited(wait=_retry_after(response.headers.get("Retry-After")))
             if response.status_code >= 500:
+                logger.warning("Location provider returned HTTP %s", response.status_code)
                 raise LocationUnavailable()
             if response.status_code != 200:
+                logger.warning("Location provider returned HTTP %s", response.status_code)
                 raise LocationProviderError()
             body = bytearray()
             for chunk in response.iter_content(chunk_size=8192):
@@ -327,6 +363,7 @@ def _fetch_locations(url, user_agent, query, limit, timeout):
                 raise LocationProviderError() from exc
         return _normalize_results(payload, limit)
     except (requests.Timeout, requests.ConnectionError) as exc:
+        logger.warning("Location provider request failed: %s", type(exc).__name__)
         raise LocationUnavailable() from exc
     except requests.RequestException as exc:
         raise LocationProviderError() from exc
@@ -348,7 +385,7 @@ def search_locations(*, q, area="", limit=5):
     ttl = settings.LOCATION_SEARCH_CACHE_TTL
     if not math.isfinite(interval) or not math.isfinite(timeout) or timeout <= 0 or ttl <= 0:
         raise LocationUnavailable()
-    identity = json.dumps([url, q.casefold(), area.casefold(), limit], ensure_ascii=False)
+    identity = json.dumps([url, q.casefold(), area.casefold(), limit, "city-area-v2"], ensure_ascii=False)
     key = hashlib.sha256(identity.encode()).hexdigest()
     now = timezone.now()
     cached = LocationSearchCache.objects.filter(key=key, expires_at__gt=now).first()

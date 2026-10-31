@@ -1,3 +1,6 @@
+import base64
+import json
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 from django.core.cache import cache
@@ -384,6 +387,33 @@ class GoogleSignInTests(TestCase):
         self.assertEqual(response.data["errors"][0]["code"], "invalid_credentials")
         self.assertFalse(User.objects.exists())
         self.assertNotIn("sessionid", self.client.cookies)
+
+    def test_google_clock_tolerance_keeps_time_and_audience_checks(self):
+        # Exercise Google's real claims verifier; only certificate fetching and
+        # signature verification are mocked for this clock-boundary regression.
+        self.verifier.stop()
+        now = 1793378257
+        encode = lambda value: base64.urlsafe_b64encode(json.dumps(value).encode()).rstrip(b"=").decode()
+        for issued_offset, expiry_offset, audience, expected in (
+            (2, 3600, "test-client.apps.googleusercontent.com", 200),
+            (30, 3600, "test-client.apps.googleusercontent.com", 200),
+            (31, 3600, "test-client.apps.googleusercontent.com", 401),
+            (-3600, -31, "test-client.apps.googleusercontent.com", 401),
+            (2, 3600, "other-client.apps.googleusercontent.com", 401),
+        ):
+            with self.subTest(issued_offset=issued_offset, expiry_offset=expiry_offset, audience=audience):
+                cache.clear()
+                claims = {**self.claims, "iat": now + issued_offset,
+                          "exp": now + expiry_offset, "aud": audience,
+                          "iss": "https://accounts.google.com"}
+                token = f'{encode({"alg": "RS256"})}.{encode(claims)}.c2lnbmF0dXJl'
+                with (
+                    patch("google.oauth2.id_token._fetch_certs", return_value={}),
+                    patch("google.auth.jwt.crypt.verify_signature", return_value=True),
+                    patch("google.auth._helpers.utcnow", return_value=datetime.fromtimestamp(now, timezone.utc)),
+                ):
+                    response = self.sign_in(body={"credential": token})
+                self.assertEqual(response.status_code, expected)
 
     def test_unverified_email_or_invalid_subject_rejected(self):
         for claims in (
