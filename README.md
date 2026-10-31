@@ -298,26 +298,44 @@ Referensi log chat:
 
 #### Overview
 
-[Isi alat/model AI yang digunakan dan bantuan yang diterima dalam pengerjaan Match/Reservation. Jika tidak menggunakan AI, nyatakan di sini.]
+Dalam pengerjaan modul Match/Reservation (backend dan frontend), saya menggunakan bantuan AI (Kiro, model Claude) sebagai alat pendukung.
+
+Backend (Django REST Framework) — app `reservations`:
+- Serializer dan view untuk alur reservation: pembuatan claim dari listing dan offer dari request, revise quantity oleh submitter, accept atomik dengan snapshot terms dan alokasi stok, reject dan cancel dengan pelepasan alokasi, serta moderasi admin.
+- Aturan sesuai API contract Revisi 2 (§5, §7.4): penolakan unknown/read-only field (400), kode `page_not_found` untuk halaman di luar rentang, 403 untuk non-approver, dan pembekuan `resource_deadline` dari listing yang terkunci saat acceptance.
+- Pembuatan dan penyempurnaan test case untuk kasus-kasus di atas.
+
+Frontend (React + TypeScript + React Router):
+- Halaman ClaimForm (claim listing), OfferForm (offer request), ReservationInbox (daftar reservation), dan ReservationDetail (detail + kontak pihak lawan).
+- Service `reservations.ts` bertipe (model Reservation/Terms/Contact) dengan bootstrap CSRF untuk request mutasi, hook data (`useReservation`, `useRequest`), validasi form sisi klien, dan pemetaan pesan error sesuai §7.4 dan §9.
+- Penggantian halaman placeholder `ModulePage` menjadi halaman nyata pada route terkait.
 
 #### Strategi Prompting
 
-[Isi cara menyusun prompt dan konteks yang diberikan kepada AI.]
+Prompt disusun iteratif dan berbasis konteks nyata, bukan permintaan generik:
+- Memberi konteks konkret dengan membuka file terkait (serializer, view, komponen) agar AI membaca kode yang sebenarnya sebelum mengusulkan perubahan, serta menempelkan output error dan log terminal apa adanya.
+- Meminta diagnosis sebab-akibat lebih dulu sebelum meminta perbaikan, agar solusi mengarah ke akar masalah, bukan tambalan.
+- Meminta AI mengikuti pola yang sudah ada di proyek agar konsisten dengan konvensi kode, struktur service, dan token design system.
+- Membatasi scope tiap langkah (satu fitur atau satu bug per interaksi) dan meminta verifikasi (test, typecheck, build) sebelum menyatakan selesai.
+- Untuk operasi berisiko (revert commit, push, menghapus volume Docker), meminta opsi dan konfirmasi terlebih dahulu sebelum dieksekusi.
 
 #### Keterbatasan AI
 
-[Isi keterbatasan atau kesalahan hasil AI yang ditemukan selama pengerjaan.]
+Keterbatasan dan kesalahan hasil AI yang ditemukan selama pengerjaan:
+- Saat verifikasi, AI sempat menebak endpoint yang salah (`/api/v1/session/`) padahal yang benar adalah `/api/v1/auth/session/`, sehingga sempat menyimpulkan 404 sebelum memeriksa `urls.py`.
+- Keluaran kode AI tetap perlu diperiksa terhadap API contract; AI dapat mengusulkan perubahan yang perlu dikoreksi agar sesuai spesifikasi (misalnya perilaku unknown-field dan kode error).
 
 #### Perbaikan Manual
 
-[Isi pemeriksaan dan perbaikan yang dilakukan sendiri terhadap hasil AI.]
+Pemeriksaan dan perbaikan yang dilakukan sendiri terhadap hasil AI:
+- Meninjau setiap perubahan serializer/view terhadap API contract Revisi 2 dan menjalankan `manage.py check`, `makemigrations --check --dry-run`, serta `manage.py test` sebelum menerima hasil.
+- Memverifikasi frontend dengan `npm run lint`, `npm run typecheck`, `npm test`, dan `npm run build`; memastikan route placeholder diganti dengan halaman yang benar.
+- Mengonfirmasi secara manual bahwa commit tidak menyertakan file sensitif (`.env`) dan hanya berisi file fitur sebelum push.
 
 Referensi log chat:
+https://drive.google.com/drive/folders/1U2TPVhRuXjYb0w1HNA5fqi_GmIZB9Tnd?usp=drive_link
 
-```text
-[LINK_CHAT_EVAN_1]
-[LINK_CHAT_EVAN_2]
-```
+
 
 ### Kaysan Navid Musyaffa — 2506625470
 
