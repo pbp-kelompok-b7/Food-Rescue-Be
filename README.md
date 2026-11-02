@@ -363,23 +363,40 @@ https://drive.google.com/drive/folders/1U2TPVhRuXjYb0w1HNA5fqi_GmIZB9Tnd?usp=dri
 
 #### Overview
 
-[Isi alat/model AI yang digunakan dan bantuan yang diterima dalam pengerjaan Request Board. Jika tidak menggunakan AI, nyatakan di sini.]
+Dalam proses pengerjaan Request Board, saya menggunakan bantuan Codex sebagai alat pendukung.
+
+- Memberikan Technical Design & API Contract, dokumen alur modul, Figma, dan issue GitHub agar AI memahami fitur yang perlu dikerjakan.
+
+- Membantu saya dalam mengerjakan fitur browse, filter, detail, dan histori request; dilanjutkan create/edit, kemudian close dan delete/archive. Implementasi mencakup validasi, pembatasan akses, perhitungan quantity, serta perlindungan riwayat reservation dan pickup pada Request Board
+
+- Membantu saya dalam implementasi halaman supply saya beserta alur close dan delete/archive pada Supply Listing.
+
+- Membantu saya dalam mengerjakan validasi kontrak, otorisasi, privasi, audit atomik, dan throttling, kemudian expiry serta konsistensi quantity lintas listing, request, reservation, dan pickup pada Shared Fundation
+
+- Membandingkan tampilan dengan Figma untuk bagian frontend dan debugging.
 
 #### Strategi Prompting
 
-[Isi cara menyusun prompt dan konteks yang diberikan kepada AI.]
+- Memberikan issue dan dokumen acuan yang spesifik untuk setiap pekerjaan.
+- Menyertakan file terkait, pesan error terminal, dan screenshot untuk menjelaskan masalah.
+- Meminta implementasi mengikuti kontrak API dan struktur proyek yang sudah ada.
+- Meminta penjelasan alur CRUD dan setiap potongan kode untuk membantu memahami implementasi.
+- Meminta pengujian ulang dan pemeriksaan kesesuaian terhadap spesifikasi sebelum menerima hasil.
 
 #### Keterbatasan AI
 
-[Isi keterbatasan atau kesalahan hasil AI yang ditemukan selama pengerjaan.]
+- Tampilan awal frontend belum sepenuhnya sesuai Figma, sehingga perlu koreksi berdasarkan perbandingan langsung.
+- AI sempat menambahkan field di luar kontrak dan memisahkan logika ke file tambahan yang tidak saya inginkan.
+- AI sempat mengubah dokumentasi di luar permintaan.
+- Pernyataan bahwa implementasi selesai masih perlu diverifikasi melalui pengujian dan pemeriksaan dependensi.
+- Audit ulang menemukan validasi offset waktu dan status setelah expiry yang perlu diperbaiki.
 
 #### Perbaikan Manual
 
-[Isi pemeriksaan dan perbaikan yang dilakukan sendiri terhadap hasil AI.]
+- Membandingkan hasil antarmuka dengan Figma dan menunjukkan bagian yang perlu direvisi.
+- Meninjau scope berdasarkan issue dan kontrak, lalu meminta penghapusan tambahan yang tidak diperlukan.
+- Meminta penyederhanaan struktur Request Board agar mengikuti struktur app yang sudah tersedia.
+- Meninjau perubahan sebelum melakukan commit dan push secara manual.
 
 Referensi log chat:
-
-```text
-[LINK_CHAT_KAYSAN_1]
-[LINK_CHAT_KAYSAN_2]
-```
+https://drive.google.com/file/d/106HyqLFh_2XZQBuqvJrVyjOJsB36AVOr/view?usp=sharing
